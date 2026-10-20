@@ -36,5 +36,4 @@ srun python -u -m training.train_env \
   --use_wandb true \
   --store_model true \
   --skip_rollout \
-  --cameras fixedfar \
-  --num_video_episodes 1
+  --skip_video
