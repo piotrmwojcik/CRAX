@@ -19,6 +19,7 @@ source .venv-py312/bin/activate
 
 unset JAX_PLATFORMS
 export MUJOCO_GL=egl
+export WANDB_BASE_URL=https://api.forge.coreweave.com
 export PYTHONUNBUFFERED=1
 
 # Fail early if JAX cannot access the allocated GPU.
