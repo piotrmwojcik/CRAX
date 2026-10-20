@@ -32,7 +32,7 @@ srun python -u -m training.train_env \
   --max_replay_size 1000000 \
   --difficulty 1 \
   --seeds 0 \
-  --use_wandb false \
+  --use_wandb true \
   --store_model true \
   --skip_rollout \
   --cameras fixedfar \
