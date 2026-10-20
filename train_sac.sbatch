@@ -24,10 +24,12 @@ export PYTHONUNBUFFERED=1
 # Fail early if JAX cannot access the allocated GPU.
 python -c "import jax; print(jax.devices()); assert any(d.platform == 'gpu' for d in jax.devices()), 'GPU not detected'"
 
-# Use this checkout's default SAC-Lagrange training hyperparameters.
+# Use CLI training defaults except for an explicit replay capacity:
+# the CLI default is None, which this SAC-Lagrange trainer cannot convert to int.
 srun python -u -m training.train_env \
   --env_name safe_pathway_walker2d \
   --alg sac_lag \
+  --max_replay_size 1000000 \
   --difficulty 1 \
   --seeds 0 \
   --use_wandb false \
