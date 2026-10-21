@@ -57,6 +57,7 @@ from training import replay_buffers
 from training import types
 from training.acme import running_statistics
 from training.acme import specs
+from training.agents.sac import checkpoint
 from training.agents.sac_lag import losses as sac_lag_losses
 from training.agents.sac_lag import networks as sac_lag_networks
 from training.types import Params, PRNGKey
@@ -234,6 +235,7 @@ def train(
     # Hooks for custom lambda update (used by SAC-PID etc.)
     lambda_update_fn: Optional[Callable] = None,
     init_aux_state_fn: Optional[Callable] = None,
+    save_checkpoint_path: Optional[str] = None,
 ):
     """SAC-Lagrangian training.
 
@@ -283,6 +285,10 @@ def train(
         comparable to PPO-Lag's lagrangian_coef_rate.
       initial_lambda: initial value of the Lagrange multiplier.
       lambda_max: upper bound on the Lagrange multiplier (prevents runaway).
+      save_checkpoint_path: directory for policy checkpoints. A checkpoint is
+        saved after each evaluation and at the end of training. It includes the
+        observation normalizer and policy parameters; the Lagrange multiplier
+        is recorded in the checkpoint config.
 
     Returns:
       Tuple of (make_policy, params, metrics).
@@ -795,6 +801,22 @@ def train(
             logging.info(metrics)
             progress_fn(current_step, metrics)
 
+            if save_checkpoint_path is not None:
+                params = _unpmap(
+                    (training_state.normalizer_params, training_state.policy_params)
+                )
+                ckpt_config = checkpoint.network_config(
+                    observation_size=obs_size,
+                    action_size=env.action_size,
+                    normalize_observations=normalize_observations,
+                    network_factory=network_factory,
+                )
+                ckpt_config.algorithm = 'sac_lag'
+                ckpt_config.lambda_lagr = float(
+                    _unpmap(training_state.lambda_lagr)
+                )
+                checkpoint.save(save_checkpoint_path, current_step, params, ckpt_config)
+
     total_steps = current_step
     if not total_steps >= num_timesteps:
         raise AssertionError(
@@ -804,6 +826,16 @@ def train(
     params = _unpmap(
         (training_state.normalizer_params, training_state.policy_params)
     )
+    if process_id == 0 and save_checkpoint_path is not None:
+        ckpt_config = checkpoint.network_config(
+            observation_size=obs_size,
+            action_size=env.action_size,
+            normalize_observations=normalize_observations,
+            network_factory=network_factory,
+        )
+        ckpt_config.algorithm = 'sac_lag'
+        ckpt_config.lambda_lagr = float(_unpmap(training_state.lambda_lagr))
+        checkpoint.save(save_checkpoint_path, total_steps, params, ckpt_config)
     pmap.assert_is_replicated(training_state)
     logging.info('total steps: %s', total_steps)
     pmap.synchronize_hosts()
