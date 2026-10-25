@@ -90,12 +90,28 @@ class TrainingState:
     alpha_optimizer_state: optax.OptState
     alpha_params: Params
     lambda_lagr: jnp.ndarray   # Lagrange multiplier (scalar, >= 0)
+    observed_episode_length: jnp.ndarray
     normalizer_params: running_statistics.RunningStatisticsState
     aux_state: Any              # Extra state for custom lambda update fns (e.g. PID)
 
 
 def _unpmap(v):
     return jax.tree_util.tree_map(lambda x: x[0], v)
+
+
+def update_observed_episode_length(
+    previous_length: jnp.ndarray,
+    completed_length_sum: jnp.ndarray,
+    completed_episode_count: jnp.ndarray,
+    ema: float,
+) -> jnp.ndarray:
+    """Updates an EMA from newly completed episode lengths."""
+    batch_length = completed_length_sum / jnp.maximum(completed_episode_count, 1.0)
+    return jnp.where(
+        completed_episode_count > 0,
+        ema * previous_length + (1.0 - ema) * batch_length,
+        previous_length,
+    )
 
 
 def _random_translate_pixels(obs: Dict[str, jax.Array], key: PRNGKey) -> Dict[str, jax.Array]:
@@ -143,6 +159,7 @@ def _init_training_state(
     q_optimizer: optax.GradientTransformation,
     qc_optimizer: optax.GradientTransformation,
     initial_lambda: float,
+    initial_observed_episode_length: float,
     aux_state: Any = (),
 ) -> TrainingState:
     """Initialises the training state and replicates it over devices."""
@@ -182,6 +199,9 @@ def _init_training_state(
         alpha_optimizer_state=alpha_optimizer_state,
         alpha_params=log_alpha,
         lambda_lagr=lambda_lagr,
+        observed_episode_length=jnp.asarray(
+            initial_observed_episode_length, dtype=jnp.float32
+        ),
         normalizer_params=normalizer_params,
         aux_state=aux_state,
     )
@@ -229,6 +249,8 @@ def train(
     augment_pixels: bool = False,
     # SAC-Lag specific
     safety_bound: float = 25.0,
+    observed_episode_length_bound: bool = False,
+    episode_length_ema: float = 0.9,
     lagrangian_lr: float = 0.01,
     initial_lambda: float = 0.0,
     lambda_max: float = 2.0,
@@ -280,6 +302,9 @@ def train(
         in each sampled training batch (same shift across a grad-update's
         batch, applied to both `observation` and `next_observation`).
       safety_bound: episodic cumulative cost limit (constraint threshold d).
+      observed_episode_length_bound: derive the per-step cost limit from an
+        EMA of completed training episode lengths instead of `episode_length`.
+      episode_length_ema: EMA coefficient for the observed episode length.
       lagrangian_lr: learning rate for the Lagrange multiplier. Normalized
         internally by episode_length so the effective per-episode update rate is
         comparable to PPO-Lag's lagrangian_coef_rate.
@@ -307,6 +332,19 @@ def train(
     max_replay_size = int(max_replay_size)
     min_replay_size = int(min_replay_size)
 
+    if observed_episode_length_bound:
+        if episode_length is None or episode_length <= 0:
+            raise ValueError(
+                'observed_episode_length_bound requires a positive episode_length.'
+            )
+        if not 0.0 <= episode_length_ema < 1.0:
+            raise ValueError('episode_length_ema must be in [0, 1).')
+        if lambda_update_fn is not None:
+            raise ValueError(
+                'observed_episode_length_bound currently supports the built-in '
+                'SAC-Lag multiplier update only.'
+            )
+
     # Convert episodic safety bound to per-step bound
     per_step_safety_bound = safety_bound / episode_length if episode_length else safety_bound
 
@@ -317,18 +355,26 @@ def train(
     effective_lagrangian_lr = lagrangian_lr / max(episode_length or 1, 1)
 
     # Build the lambda update function if not provided by caller.
-    # Signature: (lambda_lagr, aux_state, mean_cost) -> (new_lambda, new_aux_state, metrics_dict)
+    # Default signature optionally also receives the observed episode length.
     if lambda_update_fn is None:
         _eff_lr = effective_lagrangian_lr
         _lmax = float(lambda_max)
         _bound = per_step_safety_bound
-        def lambda_update_fn(lambda_lagr, aux_state, mean_cost):
-            cost_violation = mean_cost - _bound
+        def lambda_update_fn(lambda_lagr, aux_state, mean_cost, observed_length=None):
+            if observed_episode_length_bound:
+                step_bound = safety_bound / jnp.maximum(observed_length, 1.0)
+            else:
+                step_bound = _bound
+            cost_violation = mean_cost - step_bound
             new_lambda = jnp.minimum(
                 jax.nn.relu(lambda_lagr + _eff_lr * cost_violation),
                 jnp.asarray(_lmax, jnp.float32),
             )
-            return new_lambda, aux_state, {'lambda_lagr': new_lambda, 'cost_violation': cost_violation}
+            metrics = {'lambda_lagr': new_lambda, 'cost_violation': cost_violation}
+            if observed_episode_length_bound:
+                metrics['observed_episode_length'] = observed_length
+                metrics['per_step_safety_bound'] = step_bound
+            return new_lambda, aux_state, metrics
 
     init_aux = init_aux_state_fn() if init_aux_state_fn is not None else ()
 
@@ -516,9 +562,17 @@ def train(
 
         # --- Lagrange multiplier update ---
         mean_cost = jnp.mean(transitions.extras['state_extras']['cost'])
-        new_lambda_lagr, new_aux_state, lambda_metrics = lambda_update_fn(
-            training_state.lambda_lagr, training_state.aux_state, mean_cost
-        )
+        if observed_episode_length_bound:
+            new_lambda_lagr, new_aux_state, lambda_metrics = lambda_update_fn(
+                training_state.lambda_lagr,
+                training_state.aux_state,
+                mean_cost,
+                training_state.observed_episode_length,
+            )
+        else:
+            new_lambda_lagr, new_aux_state, lambda_metrics = lambda_update_fn(
+                training_state.lambda_lagr, training_state.aux_state, mean_cost
+            )
 
         metrics = {
             'critic_loss': critic_loss_val,
@@ -544,6 +598,7 @@ def train(
             alpha_optimizer_state=alpha_optimizer_state,
             alpha_params=alpha_params,
             lambda_lagr=new_lambda_lagr,
+            observed_episode_length=training_state.observed_episode_length,
             normalizer_params=training_state.normalizer_params,
             aux_state=new_aux_state,
         )
@@ -587,6 +642,24 @@ def train(
             normalizer_params=normalizer_params,
             env_steps=new_env_steps,
         )
+        if observed_episode_length_bound:
+            episode_done = env_state.info['episode_done']
+            episode_lengths = env_state.info['episode_metrics']['length']
+            completed_episode_count = jax.lax.psum(
+                jnp.sum(episode_done), axis_name=_PMAP_AXIS_NAME
+            )
+            completed_length_sum = jax.lax.psum(
+                jnp.sum(episode_done * episode_lengths), axis_name=_PMAP_AXIS_NAME
+            )
+            observed_length = update_observed_episode_length(
+                training_state.observed_episode_length,
+                completed_length_sum,
+                completed_episode_count,
+                episode_length_ema,
+            )
+            training_state = training_state.replace(
+                observed_episode_length=observed_length
+            )
         buffer_state, transitions = replay_buffer.sample(buffer_state)
         if augment_pixels:
             training_key, key_aug_obs, key_aug_next = jax.random.split(training_key, 3)
@@ -705,6 +778,7 @@ def train(
         q_optimizer=q_optimizer,
         qc_optimizer=qc_optimizer,
         initial_lambda=initial_lambda,
+        initial_observed_episode_length=episode_length,
         aux_state=init_aux,
     )
     del global_key
@@ -714,6 +788,15 @@ def train(
     env_keys = jax.random.split(env_key, num_envs // jax.process_count())
     env_keys = jnp.reshape(env_keys, (local_devices_to_use, -1) + env_keys.shape[1:])
     env_state = jax.pmap(env.reset)(env_keys)
+    if observed_episode_length_bound and (
+        'episode_done' not in env_state.info
+        or 'episode_metrics' not in env_state.info
+        or 'length' not in env_state.info.get('episode_metrics', {})
+    ):
+        raise ValueError(
+            'observed_episode_length_bound requires an environment wrapped '
+            'with episode tracking.'
+        )
 
     buffer_state = jax.pmap(replay_buffer.init)(
         jax.random.split(rb_key, local_devices_to_use)

@@ -27,10 +27,13 @@ python -c "import jax; print(jax.devices()); assert any(d.platform == 'gpu' for 
 
 # Use CLI training defaults except for an explicit replay capacity:
 # the CLI default is None, which this SAC-Lagrange trainer cannot convert to int.
+# Adjust the per-step safety bound using the EMA of completed episode lengths.
 srun python -u -m training.train_env \
   --env_name safe_pathway_walker2d \
   --alg sac_lag \
   --max_replay_size 1000000 \
+  --observed_episode_length_bound true \
+  --episode_length_ema 0.9 \
   --difficulty 1 \
   --seeds 0 \
   --use_wandb true \

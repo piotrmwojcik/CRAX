@@ -195,6 +195,20 @@ def add_shared_training_args(parser: argparse.ArgumentParser) -> argparse.Argume
                         help="SAC-Lag: maximum replay buffer size before training starts")
     parser.add_argument("--grad_updates_per_step", type=int, default=1,
                         help="SAC-Lag: gradient updates per environment step")
+    parser.add_argument(
+        "--observed_episode_length_bound",
+        type=bool_type,
+        nargs="?",
+        const=True,
+        default=False,
+        help="SAC-Lag: derive the per-step cost limit from observed episode lengths",
+    )
+    parser.add_argument(
+        "--episode_length_ema",
+        type=float,
+        default=0.9,
+        help="SAC-Lag: EMA coefficient for observed episode length",
+    )
 
     # --- WandB ---
     parser.add_argument("--use_wandb", type=bool_type, nargs="?", const=True, default=True, help="Enable wandb logging")
