@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=18
 #SBATCH --gpus=1
-#SBATCH --time=04:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -25,12 +25,17 @@ export PYTHONUNBUFFERED=1
 # Fail early if JAX cannot access the allocated GPU.
 python -c "import jax; print(jax.devices()); assert any(d.platform == 'gpu' for d in jax.devices()), 'GPU not detected'"
 
-# Use CLI training defaults except for an explicit replay capacity:
-# the CLI default is None, which this SAC-Lagrange trainer cannot convert to int.
-# Adjust the per-step safety bound using the EMA of completed episode lengths.
+# Match the upstream SAC-Lagrange experiment scale. The CLI defaults are
+# repeated here so the job configuration is explicit and easy to audit.
+# max_replay_size is explicit because this trainer cannot convert its None
+# default to int. Adjust the per-step safety bound using completed episodes.
 srun python -u -m training.train_env \
   --env_name safe_pathway_walker2d \
   --alg sac_lag \
+  --num_timesteps 500000000 \
+  --num_envs 2048 \
+  --batch_size 1024 \
+  --grad_updates_per_step 32 \
   --max_replay_size 1000000 \
   --observed_episode_length_bound true \
   --episode_length_ema 0.9 \
