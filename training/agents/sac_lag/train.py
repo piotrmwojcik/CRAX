@@ -95,6 +95,8 @@ class TrainingState:
     observed_episode_length: jnp.ndarray
     normalizer_params: running_statistics.RunningStatisticsState
     aux_state: Any              # Extra state for custom lambda update fns (e.g. PID)
+    lambda_params: Any = ()
+    lambda_optimizer_state: Any = ()
 
 
 def _unpmap(v):
@@ -163,6 +165,8 @@ def _init_training_state(
     initial_lambda: float,
     initial_observed_episode_length: float,
     aux_state: Any = (),
+    lambda_params: Any = (),
+    lambda_optimizer_state: Any = (),
 ) -> TrainingState:
     """Initialises the training state and replicates it over devices."""
     key_policy, key_q, key_qc = jax.random.split(key, 3)
@@ -206,6 +210,8 @@ def _init_training_state(
         ),
         normalizer_params=normalizer_params,
         aux_state=aux_state,
+        lambda_params=lambda_params,
+        lambda_optimizer_state=lambda_optimizer_state,
     )
     devices = jax.local_devices()[:local_devices_to_use]
     sharding = jax.sharding.NamedSharding(
@@ -263,6 +269,8 @@ def train(
     lambda_max: float = 2.0,
     cost_conditioning: bool = False,
     cost_configurations: Optional[Sequence] = None,
+    cost_parameter_bounds: Optional[Sequence] = None,
+    lambda_network_lr: float = 0.001,
     cost_nominal_probability: float = 0.5,
     # Hooks for custom lambda update (used by SAC-PID etc.)
     lambda_update_fn: Optional[Callable] = None,
@@ -323,7 +331,10 @@ def train(
       cost_conditioning: enable Safe Pathway cost-conditioned replay (state observations,
         action_repeat=1). Keeps rewards and data collection at the nominal task.
       cost_configurations: alternative (exponent, hazard weight, terminal penalty)
-        triples or dictionaries; nominal configuration is derived from the environment.
+        triples for legacy discrete mode; omitted selects continuous uniform sampling.
+      cost_parameter_bounds: uniform [min, max] bounds for the three parameters;
+        defaults to half/twice the nominal values.
+      lambda_network_lr: Adam learning rate for lambda(psi), without episode-length division.
       cost_nominal_probability: probability of nominal conditioning per replay sample.
       save_checkpoint_path: directory for policy checkpoints. A checkpoint is
         saved after each evaluation and at the end of training. It includes the
@@ -348,8 +359,14 @@ def train(
     min_replay_size = int(min_replay_size)
 
     cost_bank = None
+    uniform_costs = cost_conditioning and cost_configurations is None
+    lambda_params, lambda_optimizer_state = (), ()
     if cost_configurations is not None and not cost_conditioning:
         raise ValueError('cost_configurations requires cost_conditioning=True.')
+    if cost_parameter_bounds is not None and not cost_conditioning:
+        raise ValueError('cost_parameter_bounds requires cost_conditioning=True.')
+    if cost_parameter_bounds is not None and cost_configurations is not None:
+        raise ValueError('Choose continuous bounds or discrete configurations, not both.')
     if cost_conditioning:
         from crax.envs.safe_pathway import SafePathway
         base_env = environment.unwrapped
@@ -367,10 +384,23 @@ def train(
             raise ValueError('Cost conditioning requires a positive episode_length.')
         if safety_bound < 0 or lagrangian_lr < 0 or not 0 <= initial_lambda <= lambda_max:
             raise ValueError('Invalid cost bound, multiplier learning rate, or multiplier range.')
-        cost_bank = conditioning.parameter_bank(
-            (2.0, base_env._cost_scaler, base_env._unhealthy_termination_cost),
-            cost_configurations,
+        nominal_cost = conditioning.validate_parameters(
+            (2.0, base_env._cost_scaler, base_env._unhealthy_termination_cost)
         )
+        if uniform_costs:
+            if not np.isfinite(lambda_network_lr) or lambda_network_lr <= 0 or not np.isfinite(lambda_max) or lambda_max <= 0:
+                raise ValueError('Continuous lambda requires finite positive lambda_network_lr and lambda_max.')
+            cost_bounds = conditioning.parameter_bounds(nominal_cost, cost_parameter_bounds)
+            cost_bank = (nominal_cost,)
+            lambda_network = conditioning.MultiplierNetwork(nominal_cost, cost_bounds, lambda_max, initial_lambda)
+            lambda_params = lambda_network.init(jax.random.fold_in(jax.random.PRNGKey(seed), 1729), jnp.asarray(nominal_cost))
+            lambda_optimizer = optax.adam(lambda_network_lr)
+            lambda_optimizer_state = lambda_optimizer.init(lambda_params)
+            initial_lambda = lambda_network.apply(lambda_params, jnp.asarray(nominal_cost))
+            logging.info('Uniform cost bounds: %s; learned lambda(psi)', cost_bounds)
+        else:
+            cost_bank = conditioning.parameter_bank(nominal_cost, cost_configurations)
+            initial_lambda = jnp.full((len(cost_bank),), initial_lambda, dtype=jnp.float32)
         if getattr(network_factory, 'func', network_factory) is not sac_lag_networks.make_sac_lag_networks:
             raise ValueError('Cost conditioning requires the standard SAC-Lag state network factory.')
         network_factory = functools.partial(
@@ -378,18 +408,27 @@ def train(
             **getattr(network_factory, 'keywords', {}),
             nominal_cost_parameters=cost_bank[0],
         )
-        initial_lambda = jnp.full((len(cost_bank),), initial_lambda, dtype=jnp.float32)
         logging.info('Cost conditioning configurations (nominal first): %s', cost_bank)
 
     def add_cost_checkpoint_metadata(config, state):
         multipliers = _unpmap(state.lambda_lagr)
         config.algorithm = 'sac_lag'
-        config.lambda_lagr = float(multipliers[0] if cost_conditioning else multipliers)
+        config.lambda_lagr = float(multipliers[0] if cost_conditioning and not uniform_costs else multipliers)
         if cost_conditioning:
             config.cost_conditioning = True
             config.cost_parameter_names = list(conditioning.PARAMETER_NAMES)
-            config.cost_configurations = [list(values) for values in cost_bank]
-            config.cost_multipliers = jax.device_get(multipliers).tolist()
+            config.cost_sampling = 'uniform' if uniform_costs else 'discrete'
+            if uniform_costs:
+                config.cost_parameter_bounds = [list(pair) for pair in cost_bounds]
+                config.lambda_network_lr = lambda_network_lr
+                config.lambda_max = lambda_max
+                config.lambda_network_architecture = 'mlp_32_32_tanh_sigmoid_v1'
+                config.lambda_network_params = jax.tree_util.tree_map(
+                    lambda value: np.asarray(value).tolist(), _unpmap(state.lambda_params)
+                )
+            else:
+                config.cost_configurations = [list(values) for values in cost_bank]
+                config.cost_multipliers = jax.device_get(multipliers).tolist()
             config.cost_nominal_probability = cost_nominal_probability
             config.safety_bound = safety_bound
             config.cost_dual_estimator = 'nominal_replay_mean_cost'
@@ -580,10 +619,19 @@ def train(
                 axis_name=_PMAP_AXIS_NAME,
             )
             key, condition_key = jax.random.split(key)
-            transitions, configuration_ids = conditioning.relabel(
-                transitions, condition_key, cost_bank, cost_nominal_probability
-            )
-            actor_lambda = training_state.lambda_lagr[configuration_ids]
+            if uniform_costs:
+                transitions, nominal_mask = conditioning.relabel_uniform(
+                    transitions, condition_key, nominal_cost, cost_bounds, cost_nominal_probability
+                )
+                sampled_parameters = transitions.observation['cost_parameters']
+                actor_lambda = jax.lax.stop_gradient(lambda_network.apply(
+                    training_state.lambda_params, sampled_parameters
+                ))
+            else:
+                transitions, configuration_ids = conditioning.relabel(
+                    transitions, condition_key, cost_bank, cost_nominal_probability
+                )
+                actor_lambda = training_state.lambda_lagr[configuration_ids]
         else:
             actor_lambda = training_state.lambda_lagr
         key, key_alpha, key_critic, key_cost_critic, key_actor = jax.random.split(key, 5)
@@ -647,24 +695,47 @@ def train(
 
         # --- Lagrange multiplier update ---
         mean_cost = jnp.mean(transitions.extras['state_extras']['cost'])
+        new_lambda_params = training_state.lambda_params
+        new_lambda_optimizer_state = training_state.lambda_optimizer_state
         if cost_conditioning:
             length = training_state.observed_episode_length if observed_episode_length_bound else episode_length
             step_bound = safety_bound / jnp.maximum(length, 1.0)
-            new_lambda_lagr, violations = conditioning.update_multipliers(
-                training_state.lambda_lagr, configuration_costs, step_bound,
-                effective_lagrangian_lr, lambda_max,
-            )
             new_aux_state = training_state.aux_state
-            lambda_metrics = {
-                'lambda_lagr': new_lambda_lagr[0],
-                'cost_violation': violations[0],
-                'per_step_safety_bound': step_bound,
-                'relabelled_mean_cost': mean_cost,
-            }
-            for i in range(len(cost_bank)):
-                lambda_metrics[f'cost_configuration_{i}/lambda'] = new_lambda_lagr[i]
-                lambda_metrics[f'cost_configuration_{i}/mean_cost'] = configuration_costs[i]
-                lambda_metrics[f'cost_configuration_{i}/violation'] = violations[i]
+            if uniform_costs:
+                dual_loss, dual_grads = jax.value_and_grad(lambda params: conditioning.multiplier_loss(
+                    lambda_network, params, sampled_parameters,
+                    transitions.extras['state_extras']['cost'], step_bound,
+                ))(training_state.lambda_params)
+                dual_grads = jax.lax.pmean(dual_grads, axis_name=_PMAP_AXIS_NAME)
+                dual_updates, new_lambda_optimizer_state = lambda_optimizer.update(
+                    dual_grads, training_state.lambda_optimizer_state, training_state.lambda_params
+                )
+                new_lambda_params = optax.apply_updates(training_state.lambda_params, dual_updates)
+                new_lambda_lagr = lambda_network.apply(new_lambda_params, jnp.asarray(nominal_cost))
+                sampled_lambdas = lambda_network.apply(new_lambda_params, sampled_parameters)
+                lambda_metrics = {
+                    'lambda_lagr': new_lambda_lagr,
+                    'cost_violation': configuration_costs[0] - step_bound,
+                    'lambda_dual_loss': jax.lax.pmean(dual_loss, axis_name=_PMAP_AXIS_NAME),
+                    'lambda_sampled_mean': jnp.mean(sampled_lambdas),
+                    'lambda_sampled_min': jnp.min(sampled_lambdas),
+                    'lambda_sampled_max': jnp.max(sampled_lambdas),
+                    'cost_nominal_fraction': jnp.mean(nominal_mask),
+                }
+                for i, name in enumerate(conditioning.PARAMETER_NAMES):
+                    lambda_metrics[f'cost_parameters/{name}_mean'] = jnp.mean(sampled_parameters[..., i])
+            else:
+                new_lambda_lagr, violations = conditioning.update_multipliers(
+                    training_state.lambda_lagr, configuration_costs, step_bound,
+                    effective_lagrangian_lr, lambda_max,
+                )
+                lambda_metrics = {'lambda_lagr': new_lambda_lagr[0], 'cost_violation': violations[0]}
+                for i in range(len(cost_bank)):
+                    lambda_metrics[f'cost_configuration_{i}/lambda'] = new_lambda_lagr[i]
+                    lambda_metrics[f'cost_configuration_{i}/mean_cost'] = configuration_costs[i]
+                    lambda_metrics[f'cost_configuration_{i}/violation'] = violations[i]
+            lambda_metrics['per_step_safety_bound'] = step_bound
+            lambda_metrics['relabelled_mean_cost'] = mean_cost
             if observed_episode_length_bound:
                 lambda_metrics['observed_episode_length'] = length
             mean_cost = configuration_costs[0]
@@ -707,6 +778,8 @@ def train(
             observed_episode_length=training_state.observed_episode_length,
             normalizer_params=training_state.normalizer_params,
             aux_state=new_aux_state,
+            lambda_params=new_lambda_params,
+            lambda_optimizer_state=new_lambda_optimizer_state,
         )
         return (new_training_state, key), metrics
 
@@ -886,6 +959,8 @@ def train(
         initial_lambda=initial_lambda,
         initial_observed_episode_length=episode_length,
         aux_state=init_aux,
+        lambda_params=lambda_params,
+        lambda_optimizer_state=lambda_optimizer_state,
     )
     del global_key
 

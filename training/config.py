@@ -186,7 +186,11 @@ def add_shared_training_args(parser: argparse.ArgumentParser) -> argparse.Argume
     parser.add_argument("--cost_conditioning", type=bool_type, nargs="?", const=True, default=False,
                         help="SAC-Lag only: condition Safe Pathway policy/critics on cost parameters")
     parser.add_argument("--cost_configurations", type=_json_type, default=None,
-                        help="SAC-Lag: JSON list of alternative [penetration exponent, hazard weight, terminal penalty] triples")
+                        help="SAC-Lag: optional legacy discrete triples; omit for continuous uniform sampling")
+    parser.add_argument("--cost_parameter_bounds", type=_json_type, default=None,
+                        help="SAC-Lag: uniform [min,max] pairs for exponent, hazard weight, terminal penalty; defaults to half/twice nominal")
+    parser.add_argument("--lambda_network_lr", type=float, default=0.001,
+                        help="SAC-Lag: Adam learning rate for continuous lambda(psi), without episode-length division")
     parser.add_argument("--cost_nominal_probability", type=float, default=0.5,
                         help="SAC-Lag: probability of nominal cost parameters per replay sample")
     parser.add_argument("--lagrangian_lr", type=float, default=0.01,

@@ -9,9 +9,42 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
 
 PARAMETER_NAMES = ('penetration_exponent', 'hazard_weight', 'terminal_penalty')
+
+
+class MultiplierNetwork(nn.Module):
+    """Bounded lambda(psi); sigmoid avoids dead gradients at an initial zero.
+
+    Exact endpoint initializations are moved 1e-4 of the range into the interior.
+    Hidden features are centered on nominal parameters and scaled by box widths.
+    """
+
+    nominal: tuple
+    bounds: tuple
+    maximum: float = 2.0
+    initial: float = 0.0
+
+    @nn.compact
+    def __call__(self, parameters):
+        bounds = jnp.asarray(self.bounds)
+        width = bounds[:, 1] - bounds[:, 0]
+        features = (jnp.asarray(parameters) - jnp.asarray(self.nominal)) / jnp.where(width > 0, width, 1.)
+        for _ in range(2):
+            features = nn.tanh(nn.Dense(32)(features))
+        fraction = min(max(self.initial / self.maximum, 1e-4), 1. - 1e-4)
+        bias = math.log(fraction / (1. - fraction))
+        logits = nn.Dense(1, kernel_init=nn.initializers.zeros,
+                          bias_init=nn.initializers.constant(bias))(features)
+        return self.maximum * jax.nn.sigmoid(logits[..., 0])
+
+
+def multiplier_loss(network, network_params, parameters, costs, step_bound):
+    """Minimize negative dual objective using replay-distribution violations."""
+    violations = jax.lax.stop_gradient(costs - step_bound)
+    return -jnp.mean(network.apply(network_params, parameters) * violations)
 
 
 def validate_parameters(parameters):
@@ -47,6 +80,31 @@ def parameter_bank(nominal, alternatives=None):
     return tuple(bank)
 
 
+def parameter_bounds(nominal, bounds=None):
+    """Validate uniform bounds in exponent, hazard-weight, terminal-penalty order."""
+    nominal = validate_parameters(nominal)
+    if bounds is None:
+        bounds = [(0.5 * value, 2.0 * value) for value in nominal]
+    if len(bounds) != 3 or any(len(pair) != 2 for pair in bounds):
+        raise ValueError('Cost parameter bounds must contain three [minimum, maximum] pairs.')
+    lower = validate_parameters([pair[0] for pair in bounds])
+    upper = validate_parameters([pair[1] for pair in bounds])
+    if any(lo > hi for lo, hi in zip(lower, upper)):
+        raise ValueError('Each cost parameter minimum must be <= its maximum.')
+    return tuple(zip(lower, upper))
+
+
+def sample_uniform_parameters(key, shape, nominal, bounds, nominal_probability):
+    """Independent uniform coordinates, mixed with an exact nominal point mass."""
+    nominal_key, alternative_key = jax.random.split(key)
+    bounds = jnp.asarray(bounds)
+    parameters = jax.random.uniform(
+        alternative_key, shape + (3,), minval=bounds[:, 0], maxval=bounds[:, 1]
+    )
+    is_nominal = jax.random.bernoulli(nominal_key, nominal_probability, shape)
+    return jnp.where(is_nominal[..., None], jnp.asarray(nominal), parameters), is_nominal
+
+
 def reconstruct_cost(penetration, termination, parameters):
     """Recompute scalar cost; last penetration axis enumerates hazards.
 
@@ -70,6 +128,19 @@ def relabel(transitions, key, bank, nominal_probability):
     ids = jax.random.randint(alternative_key, shape, 1, len(bank))
     ids = jnp.where(jax.random.bernoulli(nominal_key, nominal_probability, shape), 0, ids)
     parameters = jnp.asarray(bank)[ids]
+    return relabel_with_parameters(transitions, parameters), ids
+
+
+def relabel_uniform(transitions, key, nominal, bounds, nominal_probability):
+    """Draw fresh continuous cost parameters for every replayed transition."""
+    parameters, is_nominal = sample_uniform_parameters(
+        key, transitions.reward.shape, nominal, bounds, nominal_probability
+    )
+    return relabel_with_parameters(transitions, parameters), is_nominal
+
+
+def relabel_with_parameters(transitions, parameters):
+    """Apply a given parameter triple per transition without changing rewards."""
     state_extras = dict(transitions.extras['state_extras'])
     state_extras['cost'] = reconstruct_cost(
         state_extras['hazard_penetration'], state_extras['unhealthy_termination'], parameters
@@ -78,7 +149,7 @@ def relabel(transitions, key, bank, nominal_probability):
         observation=condition_observation(transitions.observation, parameters),
         next_observation=condition_observation(transitions.next_observation, parameters),
         extras={**transitions.extras, 'state_extras': state_extras},
-    ), ids
+    )
 
 
 def counterfactual_mean_costs(transitions, bank):

@@ -126,6 +126,10 @@ def main():
         parser.error('--cost_conditioning is supported only with --alg sac_lag')
     if config.cost_configurations is not None and not config.cost_conditioning:
         parser.error('--cost_configurations requires --cost_conditioning')
+    if config.cost_parameter_bounds is not None and not config.cost_conditioning:
+        parser.error('--cost_parameter_bounds requires --cost_conditioning')
+    if config.cost_parameter_bounds is not None and config.cost_configurations is not None:
+        parser.error('Choose continuous --cost_parameter_bounds or discrete --cost_configurations')
 
     env_name = config.env_name
     alg_name = config.alg

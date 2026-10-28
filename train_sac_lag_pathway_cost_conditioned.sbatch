@@ -25,11 +25,12 @@ export PYTHONUNBUFFERED=1
 python -c "import jax; print(jax.devices()); assert any(d.platform == 'gpu' for d in jax.devices()), 'GPU not detected'"
 
 # Match the Level 1 SAC-Lag baseline: 500M steps, seed 0, fixed reward.
-# Triples: [penetration exponent, hazard weight, terminal penalty].
+# Bounds: [penetration exponent, hazard weight, terminal penalty].
 # Nominal parameters are taken from the environment (defaults: [2, 1.5, 5]).
-# Each replay sample selects nominal with probability 0.5, otherwise one of
-# the six alternatives uniformly. Collection and evaluation remain nominal.
-# Each configuration has its own lambda and the same combined cost budget.
+# Each replay sample selects nominal with probability 0.5, otherwise samples
+# each parameter independently uniformly within its range.
+# A bounded neural network learns lambda(parameters) with a combined budget.
+# Collection and evaluation remain nominal; reward stays fixed.
 # State observations and the trainer's action_repeat=1 default are required.
 srun python -u -m training.train_env \
   --env_name safe_pathway_walker2d \
@@ -42,16 +43,17 @@ srun python -u -m training.train_env \
   --grad_updates_per_step 32 \
   --max_replay_size 1000000 \
   --cost_conditioning true \
-  --cost_configurations '[[1,1.5,5],[4,1.5,5],[2,0.75,5],[2,3,5],[2,1.5,2.5],[2,1.5,10]]' \
+  --cost_parameter_bounds '[[1,4],[0.75,3],[2.5,10]]' \
   --cost_nominal_probability 0.5 \
+  --lambda_network_lr 0.001 \
   --safety_bound 25 \
   --lagrangian_lr 0.01 \
   --initial_lambda 0 \
   --lambda_max 2 \
   --observed_episode_length_bound true \
   --episode_length_ema 0.9 \
-  --wandb_group safe_pathway_walker2d_cost_conditioned \
-  --wandb_tags cost_conditioned sac_lag pathway_level1 \
+  --wandb_group safe_pathway_walker2d_cost_uniform_lambda \
+  --wandb_tags cost_conditioned uniform_cost learned_lambda sac_lag pathway_level1 \
   --use_wandb true \
   --store_model true \
   --skip_rollout \

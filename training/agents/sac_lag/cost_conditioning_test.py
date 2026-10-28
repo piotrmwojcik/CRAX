@@ -8,6 +8,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from crax.envs.base import State
 from crax.envs.safe_pathway import SafePathway
@@ -96,6 +97,47 @@ class CostConditioningTest(unittest.TestCase):
         np.testing.assert_allclose(violation, [-1., -1., 9.])
         np.testing.assert_allclose(cc.counterfactual_mean_costs(self.transition(), ((2., 1.5, 5.), (1., 2., 3.))), [6.875, 6.])
 
+    def test_continuous_uniform_sampling_and_nominal_mixture(self):
+        nominal = (2., 1.5, 5.)
+        bounds = cc.parameter_bounds(nominal)
+        parameters, mask = jax.jit(lambda key: cc.sample_uniform_parameters(
+            key, (20000,), nominal, bounds, 0.5
+        ))(jax.random.PRNGKey(17))
+        self.assertAlmostEqual(float(jnp.mean(mask)), 0.5, delta=0.02)
+        np.testing.assert_array_equal(parameters[mask], np.broadcast_to(nominal, (int(mask.sum()), 3)))
+        alternatives = np.asarray(parameters[~mask])
+        lower, upper = np.asarray(bounds).T
+        self.assertTrue(np.all(alternatives >= lower))
+        self.assertTrue(np.all(alternatives <= upper))
+        normalized = (alternatives - lower) / (upper - lower)
+        np.testing.assert_allclose(normalized.mean(axis=0), 0.5, atol=0.015)
+        np.testing.assert_allclose(normalized.var(axis=0), 1. / 12., atol=0.004)
+        np.testing.assert_allclose(np.corrcoef(normalized.T), np.eye(3), atol=0.035)
+        self.assertGreater(len(np.unique(alternatives[:, 0])), 1000)
+
+    def test_uniform_relabel_preserves_reward_and_next_parameters(self):
+        batch = self.transition()
+        nominal = (2., 1.5, 5.)
+        relabelled, _ = cc.relabel_uniform(
+            batch, jax.random.PRNGKey(0), nominal, cc.parameter_bounds(nominal), 0.5
+        )
+        np.testing.assert_array_equal(relabelled.reward, batch.reward)
+        np.testing.assert_array_equal(relabelled.observation['cost_parameters'], relabelled.next_observation['cost_parameters'])
+        np.testing.assert_allclose(relabelled.extras['state_extras']['cost'], cc.reconstruct_cost(
+            batch.extras['state_extras']['hazard_penetration'],
+            batch.extras['state_extras']['unhealthy_termination'],
+            relabelled.observation['cost_parameters'],
+        ))
+
+    def test_uniform_bounds_validation(self):
+        for bounds in (((0., 4.), (0., 3.), (0., 10.)),
+                       ((4., 1.), (0., 3.), (0., 10.)),
+                       ((1., 4.), (0., float('inf')), (0., 10.)),
+                       ((1., 4.), (0., 3.))):
+            with self.assertRaises(ValueError):
+                cc.parameter_bounds((2., 1.5, 5.), bounds)
+        self.assertEqual(cc.parameter_bounds((2., 0., 0.)), ((1., 4.), (0., 0.), (0., 0.)))
+
     def test_parameters_validation_and_cli(self):
         args = build_base_parser().parse_args(['--alg', 'sac_lag', '--cost_conditioning', '--cost_configurations', '[[1, 1.5, 5]]'])
         self.assertTrue(args.cost_conditioning)
@@ -152,6 +194,66 @@ class CostConditioningTest(unittest.TestCase):
         self.assertIn('training/lambda_lagr', metrics)
         self.assertNotIn('training/cost_configuration_0/lambda', metrics)
 
+    def test_multiplier_learns_different_penalties_and_detaches_costs(self):
+        nominal = (2., 1.5, 5.)
+        network = cc.MultiplierNetwork(nominal, cc.parameter_bounds(nominal), 2., 0.5)
+        parameters = jnp.array([[1., .75, 2.5], [4., 3., 10.]])
+        costs = jnp.array([0., 2.])
+        params = network.init(jax.random.PRNGKey(7), parameters)
+        optimizer = optax.adam(0.01)
+        @jax.jit
+        def fit(params):
+            def step(carry, _):
+                params, state = carry
+                grads = jax.grad(lambda p: cc.multiplier_loss(network, p, parameters, costs, 1.))(params)
+                updates, state = optimizer.update(grads, state, params)
+                return (optax.apply_updates(params, updates), state), None
+            return jax.lax.scan(step, (params, optimizer.init(params)), None, length=100)[0][0]
+        learned = network.apply(fit(params), parameters)
+        self.assertLess(float(learned[0]), 0.5)
+        self.assertGreater(float(learned[1]), 0.5)
+        self.assertTrue(bool(jnp.all((learned >= 0.) & (learned <= 2.))))
+        cost_gradient = jax.grad(lambda c: cc.multiplier_loss(network, params, parameters, c, 1.))(costs)
+        np.testing.assert_array_equal(cost_gradient, jnp.zeros(2))
+
+    def test_zero_initial_multiplier_has_live_gradient(self):
+        nominal = (2., 1.5, 5.)
+        network = cc.MultiplierNetwork(nominal, cc.parameter_bounds(nominal), 2., 0.)
+        parameters = jnp.asarray([nominal])
+        params = network.init(jax.random.PRNGKey(0), parameters)
+        np.testing.assert_allclose(network.apply(params, parameters), [0.0002], rtol=1e-5)
+        grads = jax.grad(lambda p: cc.multiplier_loss(network, p, parameters, jnp.ones(1), 0.))(params)
+        self.assertGreater(sum(float(jnp.sum(jnp.abs(x))) for x in jax.tree_util.tree_leaves(grads)), 0.)
+
+    def test_uniform_training_and_learned_multiplier_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            make_policy, params, metrics, _ = train(
+                TinyPathway(), num_timesteps=24, episode_length=4, num_envs=2,
+                num_eval_envs=2, num_evals=2, batch_size=4, grad_updates_per_step=1,
+                min_replay_size=2, max_replay_size=32, normalize_observations=True,
+                network_factory=functools.partial(networks.make_sac_lag_networks, hidden_layer_sizes=(8,)),
+                cost_conditioning=True, safety_bound=0., lambda_network_lr=0.01,
+                observed_episode_length_bound=True, save_checkpoint_path=directory,
+            )
+            folder = sorted(Path(directory).iterdir())[-1]
+            config = checkpoint.load_config(folder)
+            self.assertEqual(config.cost_sampling, 'uniform')
+            self.assertEqual(config.cost_parameter_bounds, [[1., 4.], [.75, 3.], [2.5, 10.]])
+            self.assertNotIn('cost_configurations', config)
+            multiplier = checkpoint.load_cost_multiplier(folder)
+            np.testing.assert_allclose(multiplier((2., 1.5, 5.)), config.lambda_lagr, rtol=1e-6)
+            self.assertGreater(config.lambda_lagr, .0002)
+            sampled = multiplier(jnp.array([[1., .75, 2.5], [4., 3., 10.]]))
+            self.assertGreater(float(jnp.abs(sampled[0] - sampled[1])), 1e-8)
+            for parameters in (None, (1.7, 2.1, 8.)):
+                original = make_policy(params, deterministic=True, cost_parameters=parameters)
+                restored = checkpoint.load_policy(folder, deterministic=True, cost_parameters=parameters)
+                obs, key = jnp.zeros(2), jax.random.PRNGKey(0)
+                np.testing.assert_allclose(original(obs, key)[0], restored(obs, key)[0], atol=1e-6)
+            self.assertTrue(np.isfinite(float(metrics['training/lambda_dual_loss'])))
+            self.assertIn('training/lambda_sampled_mean', metrics)
+            self.assertNotIn('training/cost_configuration_0/lambda', metrics)
+
     def test_termination_measurements_survive_autoreset_and_timeout(self):
         for episode_length, expected_terminal in ((2, 0.), (4, 1.)):
             env = env_wrappers.wrap(TinyPathway(), episode_length=episode_length, action_repeat=1)
@@ -176,6 +278,8 @@ class CostConditioningTest(unittest.TestCase):
             ({'vision_kwargs': {}}, 'flat state'),
             ({'cost_nominal_probability': 0.0}, 'strictly between'),
             ({'lambda_update_fn': lambda *args: None}, 'SAC-Lagrangian only'),
+            ({'lambda_network_lr': 0.}, 'finite positive'),
+            ({'cost_configurations': [(1., 2., 3.)], 'cost_parameter_bounds': [[1., 4.], [0., 3.], [0., 10.]]}, 'not both'),
         ):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
                 train(TinyPathway(), num_timesteps=16, episode_length=4,

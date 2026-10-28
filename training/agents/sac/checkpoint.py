@@ -102,3 +102,23 @@ def load_policy(
   make_inference_fn = sac_networks.make_inference_fn(sac_network)
 
   return make_inference_fn(params, deterministic=deterministic)
+
+
+def load_cost_multiplier(path):
+  """Restore lambda(psi) from a continuously cost-conditioned SAC-Lag checkpoint."""
+  import jax
+  import jax.numpy as jnp
+  from training.agents.sac_lag.cost_conditioning import MultiplierNetwork
+
+  config = load_config(path).to_dict()
+  if config.get('lambda_network_architecture') != 'mlp_32_32_tanh_sigmoid_v1':
+    raise ValueError('Checkpoint does not contain a supported learned lambda(psi).')
+  network = MultiplierNetwork(
+      tuple(config['network_factory_kwargs']['nominal_cost_parameters']),
+      tuple(tuple(pair) for pair in config['cost_parameter_bounds']),
+      config['lambda_max'],
+  )
+  params = jax.tree_util.tree_map(
+      jnp.asarray, config['lambda_network_params'], is_leaf=lambda value: isinstance(value, list)
+  )
+  return lambda cost_parameters: network.apply(params, jnp.asarray(cost_parameters))
