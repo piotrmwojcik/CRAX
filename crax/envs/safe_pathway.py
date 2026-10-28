@@ -279,7 +279,12 @@ class SafePathway(PipelineEnv, ABC):
             "ctrl_cost": zero,
             "cost": zero,
         }
-        info = {"hazard_positions": hazard_positions, "cost": zero}
+        info = {
+            "hazard_positions": hazard_positions,
+            "cost": zero,
+            "hazard_penetration": jp.zeros((n_h,), dtype=jp.float32),
+            "unhealthy_termination": zero,
+        }
 
         return State(pipeline_state, obs, reward, done, metrics, info)
 
@@ -312,7 +317,8 @@ class SafePathway(PipelineEnv, ABC):
         obs = self._get_obs(pipeline_state, hazard_positions)
 
         # Hazard cost: feet inside any hazards
-        hazard_cost = self._calculate_safety_cost(pipeline_state, hazard_positions)
+        hazard_penetration = self._calculate_hazard_penetration(pipeline_state, hazard_positions)
+        hazard_cost = self._cost_scaler * jp.sum(hazard_penetration ** 2)
 
         # Terminal cost if episode ends due to being unhealthy
         terminal_cost = done * jp.asarray(self._unhealthy_termination_cost, dtype=hazard_cost.dtype)
@@ -333,6 +339,8 @@ class SafePathway(PipelineEnv, ABC):
 
         info = dict(state.info)
         info["cost"] = cost
+        info["hazard_penetration"] = hazard_penetration
+        info["unhealthy_termination"] = done
 
         return state.replace(
             pipeline_state=pipeline_state,
@@ -411,9 +419,18 @@ class SafePathway(PipelineEnv, ABC):
 
     def _calculate_safety_cost(self, pipeline_state: base.State, hazard_positions: jax.Array) -> jax.Array:
         """Calculate safety cost with gradient based on distance from hazard center."""
+        penetration = self._calculate_hazard_penetration(pipeline_state, hazard_positions)
+        return jp.asarray(self._cost_scaler, dtype=jp.float32) * jp.sum(penetration ** 2)
+
+    def _calculate_hazard_penetration(self, pipeline_state: base.State, hazard_positions: jax.Array) -> jax.Array:
+        """Maximum grounded-foot penetration per hazard, from zero to one.
+
+        Keeping measurements before applying the exponent allows replay to
+        reconstruct alternative cost shapes without rerunning physics.
+        """
         n_h = hazard_positions.shape[0]
         if n_h == 0:
-            return jp.array(0.0, dtype=jp.float32)
+            return jp.zeros((0,), dtype=jp.float32)
 
         # Get foot positions
         feet_pos = [pipeline_state.x.take(fid).pos for fid in self._foot_link_ids]
@@ -434,7 +451,7 @@ class SafePathway(PipelineEnv, ABC):
         normalized_cyl_dist = d / radii_safe
         cyl_inside = normalized_cyl_dist <= 1.0
         cyl_penetration = jp.maximum(0.0, 1.0 - normalized_cyl_dist)
-        cyl_cost_per_foot = cyl_penetration ** 2
+        cyl_cost_per_foot = cyl_penetration
         cyl_cost_per_foot = jp.where(
             cyl_inside & feet_on_ground[:, None],
             cyl_cost_per_foot,
@@ -456,7 +473,7 @@ class SafePathway(PipelineEnv, ABC):
 
         max_normalized_dist = jp.max(normalized_rect_dist, axis=2)
         rect_penetration = jp.maximum(0.0, 1.0 - max_normalized_dist)
-        rect_cost_per_foot = rect_penetration ** 2
+        rect_cost_per_foot = rect_penetration
         rect_cost_per_foot = jp.where(
             rect_inside & feet_on_ground[:, None],
             rect_cost_per_foot,
@@ -469,8 +486,7 @@ class SafePathway(PipelineEnv, ABC):
         is_cyl = 1.0 - is_rect
         per_hazard_cost = cyl_cost_per_h * is_cyl + rect_cost_per_h * is_rect
 
-        total_cost = jp.sum(per_hazard_cost)
-        return jp.asarray(self._cost_scaler, dtype=jp.float32) * total_cost
+        return per_hazard_cost
 
     # ---------------- Visualization ----------------
 

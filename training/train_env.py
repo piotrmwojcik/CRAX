@@ -122,6 +122,11 @@ def main():
     parser = build_base_parser(description='Train Safe-Brax agents from config files')
     config = parser.parse_args()
 
+    if config.cost_conditioning and config.alg != 'sac_lag':
+        parser.error('--cost_conditioning is supported only with --alg sac_lag')
+    if config.cost_configurations is not None and not config.cost_conditioning:
+        parser.error('--cost_configurations requires --cost_conditioning')
+
     env_name = config.env_name
     alg_name = config.alg
     difficulty = config.difficulty

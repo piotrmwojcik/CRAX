@@ -60,10 +60,12 @@ from training.acme import specs
 from training.agents.sac import checkpoint
 from training.agents.sac_lag import losses as sac_lag_losses
 from training.agents.sac_lag import networks as sac_lag_networks
+from training.agents.sac_lag import cost_conditioning as conditioning
 from training.types import Params, PRNGKey
 import flax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 Metrics = types.Metrics
@@ -205,8 +207,13 @@ def _init_training_state(
         normalizer_params=normalizer_params,
         aux_state=aux_state,
     )
-    return jax.device_put_replicated(
-        training_state, jax.local_devices()[:local_devices_to_use]
+    devices = jax.local_devices()[:local_devices_to_use]
+    sharding = jax.sharding.NamedSharding(
+        jax.sharding.Mesh(np.array(devices), ('i',)), jax.sharding.PartitionSpec('i')
+    )
+    return jax.tree_util.tree_map(
+        lambda value: jax.device_put(jnp.stack([value] * len(devices)), sharding),
+        training_state,
     )
 
 
@@ -254,6 +261,9 @@ def train(
     lagrangian_lr: float = 0.01,
     initial_lambda: float = 0.0,
     lambda_max: float = 2.0,
+    cost_conditioning: bool = False,
+    cost_configurations: Optional[Sequence] = None,
+    cost_nominal_probability: float = 0.5,
     # Hooks for custom lambda update (used by SAC-PID etc.)
     lambda_update_fn: Optional[Callable] = None,
     init_aux_state_fn: Optional[Callable] = None,
@@ -310,6 +320,11 @@ def train(
         comparable to PPO-Lag's lagrangian_coef_rate.
       initial_lambda: initial value of the Lagrange multiplier.
       lambda_max: upper bound on the Lagrange multiplier (prevents runaway).
+      cost_conditioning: enable Safe Pathway cost-conditioned replay (state observations,
+        action_repeat=1). Keeps rewards and data collection at the nominal task.
+      cost_configurations: alternative (exponent, hazard weight, terminal penalty)
+        triples or dictionaries; nominal configuration is derived from the environment.
+      cost_nominal_probability: probability of nominal conditioning per replay sample.
       save_checkpoint_path: directory for policy checkpoints. A checkpoint is
         saved after each evaluation and at the end of training. It includes the
         observation normalizer and policy parameters; the Lagrange multiplier
@@ -329,8 +344,56 @@ def train(
             'No training will happen because min_replay_size >= num_timesteps'
         )
     num_timesteps = int(num_timesteps)
-    max_replay_size = int(max_replay_size)
+    max_replay_size = int(max_replay_size if max_replay_size is not None else num_timesteps)
     min_replay_size = int(min_replay_size)
+
+    cost_bank = None
+    if cost_configurations is not None and not cost_conditioning:
+        raise ValueError('cost_configurations requires cost_conditioning=True.')
+    if cost_conditioning:
+        from crax.envs.safe_pathway import SafePathway
+        base_env = environment.unwrapped
+        if not isinstance(base_env, SafePathway):
+            raise ValueError('Cost conditioning currently supports Safe Pathway only.')
+        if vision_kwargs is not None or not isinstance(environment.observation_size, int):
+            raise ValueError('Cost conditioning currently requires flat state observations.')
+        if action_repeat != 1:
+            raise ValueError('Cost conditioning requires action_repeat=1 to preserve per-step measurements.')
+        if lambda_update_fn is not None:
+            raise ValueError('Cost conditioning supports SAC-Lagrangian only, without a custom multiplier update.')
+        if not 0.0 < cost_nominal_probability < 1.0:
+            raise ValueError('cost_nominal_probability must lie strictly between zero and one.')
+        if episode_length is None or episode_length <= 0:
+            raise ValueError('Cost conditioning requires a positive episode_length.')
+        if safety_bound < 0 or lagrangian_lr < 0 or not 0 <= initial_lambda <= lambda_max:
+            raise ValueError('Invalid cost bound, multiplier learning rate, or multiplier range.')
+        cost_bank = conditioning.parameter_bank(
+            (2.0, base_env._cost_scaler, base_env._unhealthy_termination_cost),
+            cost_configurations,
+        )
+        if getattr(network_factory, 'func', network_factory) is not sac_lag_networks.make_sac_lag_networks:
+            raise ValueError('Cost conditioning requires the standard SAC-Lag state network factory.')
+        network_factory = functools.partial(
+            sac_lag_networks.make_cost_conditioned_networks,
+            **getattr(network_factory, 'keywords', {}),
+            nominal_cost_parameters=cost_bank[0],
+        )
+        initial_lambda = jnp.full((len(cost_bank),), initial_lambda, dtype=jnp.float32)
+        logging.info('Cost conditioning configurations (nominal first): %s', cost_bank)
+
+    def add_cost_checkpoint_metadata(config, state):
+        multipliers = _unpmap(state.lambda_lagr)
+        config.algorithm = 'sac_lag'
+        config.lambda_lagr = float(multipliers[0] if cost_conditioning else multipliers)
+        if cost_conditioning:
+            config.cost_conditioning = True
+            config.cost_parameter_names = list(conditioning.PARAMETER_NAMES)
+            config.cost_configurations = [list(values) for values in cost_bank]
+            config.cost_multipliers = jax.device_get(multipliers).tolist()
+            config.cost_nominal_probability = cost_nominal_probability
+            config.safety_bound = safety_bound
+            config.cost_dual_estimator = 'nominal_replay_mean_cost'
+        return config
 
     if observed_episode_length_bound:
         if episode_length is None or episode_length <= 0:
@@ -450,6 +513,13 @@ def train(
     else:
         dummy_obs = jnp.zeros((obs_size,))
     dummy_action = jnp.zeros((action_size,))
+    replay_extras = {'truncation': 0.0, 'cost': 0.0}
+    if cost_conditioning:
+        replay_extras.update(
+            hazard_penetration=jnp.zeros((len(base_env._hazard_mocap_ids),)),
+            unhealthy_termination=0.0,
+        )
+    replay_extra_fields = tuple(replay_extras)
     dummy_transition = Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=dummy_obs,
         action=dummy_action,
@@ -457,7 +527,7 @@ def train(
         discount=0.0,
         next_observation=dummy_obs,
         extras={
-            'state_extras': {'truncation': 0.0, 'cost': 0.0},
+            'state_extras': replay_extras,
             'policy_extras': {},
         },
     )
@@ -501,6 +571,21 @@ def train(
         carry: Tuple[TrainingState, PRNGKey], transitions: Transition
     ) -> Tuple[Tuple[TrainingState, PRNGKey], Metrics]:
         training_state, key = carry
+        if cost_conditioning:
+            # Keep the existing replay-cost dual-ascent estimator, separately
+            # for each configuration. These are nominal replay-distribution
+            # estimates, not measured returns of the alternative policies.
+            configuration_costs = jax.lax.pmean(
+                conditioning.counterfactual_mean_costs(transitions, cost_bank),
+                axis_name=_PMAP_AXIS_NAME,
+            )
+            key, condition_key = jax.random.split(key)
+            transitions, configuration_ids = conditioning.relabel(
+                transitions, condition_key, cost_bank, cost_nominal_probability
+            )
+            actor_lambda = training_state.lambda_lagr[configuration_ids]
+        else:
+            actor_lambda = training_state.lambda_lagr
         key, key_alpha, key_critic, key_cost_critic, key_actor = jax.random.split(key, 5)
 
         # --- Entropy temperature update (unchanged from SAC) ---
@@ -544,7 +629,7 @@ def train(
             training_state.q_params,
             training_state.qc_params,
             alpha,
-            training_state.lambda_lagr,
+            actor_lambda,
             transitions,
             key_actor,
             optimizer_state=training_state.policy_optimizer_state,
@@ -562,7 +647,28 @@ def train(
 
         # --- Lagrange multiplier update ---
         mean_cost = jnp.mean(transitions.extras['state_extras']['cost'])
-        if observed_episode_length_bound:
+        if cost_conditioning:
+            length = training_state.observed_episode_length if observed_episode_length_bound else episode_length
+            step_bound = safety_bound / jnp.maximum(length, 1.0)
+            new_lambda_lagr, violations = conditioning.update_multipliers(
+                training_state.lambda_lagr, configuration_costs, step_bound,
+                effective_lagrangian_lr, lambda_max,
+            )
+            new_aux_state = training_state.aux_state
+            lambda_metrics = {
+                'lambda_lagr': new_lambda_lagr[0],
+                'cost_violation': violations[0],
+                'per_step_safety_bound': step_bound,
+                'relabelled_mean_cost': mean_cost,
+            }
+            for i in range(len(cost_bank)):
+                lambda_metrics[f'cost_configuration_{i}/lambda'] = new_lambda_lagr[i]
+                lambda_metrics[f'cost_configuration_{i}/mean_cost'] = configuration_costs[i]
+                lambda_metrics[f'cost_configuration_{i}/violation'] = violations[i]
+            if observed_episode_length_bound:
+                lambda_metrics['observed_episode_length'] = length
+            mean_cost = configuration_costs[0]
+        elif observed_episode_length_bound:
             new_lambda_lagr, new_aux_state, lambda_metrics = lambda_update_fn(
                 training_state.lambda_lagr,
                 training_state.aux_state,
@@ -613,7 +719,7 @@ def train(
     ) -> Tuple[running_statistics.RunningStatisticsState, envs.State, ReplayBufferState]:
         policy = make_policy((normalizer_params, policy_params))
         env_state, transitions = acting.actor_step(
-            env, env_state, policy, key, extra_fields=('truncation', 'cost')
+            env, env_state, policy, key, extra_fields=replay_extra_fields
         )
         normalizer_params = running_statistics.update(
             normalizer_params,
@@ -894,10 +1000,7 @@ def train(
                     normalize_observations=normalize_observations,
                     network_factory=network_factory,
                 )
-                ckpt_config.algorithm = 'sac_lag'
-                ckpt_config.lambda_lagr = float(
-                    _unpmap(training_state.lambda_lagr)
-                )
+                ckpt_config = add_cost_checkpoint_metadata(ckpt_config, training_state)
                 checkpoint.save(save_checkpoint_path, current_step, params, ckpt_config)
 
     total_steps = current_step
@@ -916,8 +1019,7 @@ def train(
             normalize_observations=normalize_observations,
             network_factory=network_factory,
         )
-        ckpt_config.algorithm = 'sac_lag'
-        ckpt_config.lambda_lagr = float(_unpmap(training_state.lambda_lagr))
+        ckpt_config = add_cost_checkpoint_metadata(ckpt_config, training_state)
         checkpoint.save(save_checkpoint_path, total_steps, params, ckpt_config)
     pmap.assert_is_replicated(training_state)
     logging.info('total steps: %s', total_steps)

@@ -183,6 +183,12 @@ def add_shared_training_args(parser: argparse.ArgumentParser) -> argparse.Argume
                         help="CRPO: tolerance added to safety_bound when deciding whether to optimize reward or cost for a training step")
 
     # --- SAC-Lag (off-policy) ---
+    parser.add_argument("--cost_conditioning", type=bool_type, nargs="?", const=True, default=False,
+                        help="SAC-Lag only: condition Safe Pathway policy/critics on cost parameters")
+    parser.add_argument("--cost_configurations", type=_json_type, default=None,
+                        help="SAC-Lag: JSON list of alternative [penetration exponent, hazard weight, terminal penalty] triples")
+    parser.add_argument("--cost_nominal_probability", type=float, default=0.5,
+                        help="SAC-Lag: probability of nominal cost parameters per replay sample")
     parser.add_argument("--lagrangian_lr", type=float, default=0.01,
                         help="SAC-Lag: Lagrange multiplier LR (per-episode scale, comparable to PPO-Lag lagrangian_coef_rate; normalized internally by episode_length)")
     parser.add_argument("--initial_lambda", type=float, default=0.0, help="SAC-Lag: initial Lagrange multiplier value")

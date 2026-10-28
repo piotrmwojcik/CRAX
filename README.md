@@ -17,6 +17,9 @@ CRAX is a high-performance benchmark for **Constrained Reinforcement Learning (S
 
 ## Safe RL Algorithms
 
+SAC-Lagrange supports optional [cost conditioning for Safe Pathway](docs/cost_conditioned_sac_lag.md),
+which varies hazard penetration sensitivity and terminal penalties while keeping rewards fixed.
+
 CRAX includes efficient JAX implementations of the following, selected with the
 `--alg` flag:
 

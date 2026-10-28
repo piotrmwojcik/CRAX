@@ -81,11 +81,23 @@ def load_policy(
         sac_networks.SACNetworks
     ] = sac_networks.make_sac_networks,
     deterministic: bool = True,
+    cost_parameters=None,
 ):
   """Loads policy inference function from SAC checkpoint."""
   path = epath.Path(path)
   config = load_config(path)
   params = load(path)
+  if config.get('cost_conditioning', False):
+    from training.agents.sac_lag import networks as lag_networks
+    from training.agents.sac_lag.cost_conditioning import validate_parameters
+    if cost_parameters is not None:
+      cost_parameters = validate_parameters(cost_parameters)
+    sac_network = _get_network(config, lag_networks.make_cost_conditioned_networks)
+    return lag_networks.make_inference_fn(sac_network)(
+        params, deterministic=deterministic, cost_parameters=cost_parameters
+    )
+  if cost_parameters is not None:
+    raise ValueError('cost_parameters requires a cost-conditioned SAC-Lag checkpoint.')
   sac_network = _get_network(config, network_factory)
   make_inference_fn = sac_networks.make_inference_fn(sac_network)
 
