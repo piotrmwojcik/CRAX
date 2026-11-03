@@ -2,7 +2,7 @@
 
 Uses compare_fake_real_hazard's placement constraints. The BC targets are
 nominal actions at the same physical states, reconstructed with real-hazard
-lidar observations. Uniform weights w_t=1; optional reference KL regularization.
+lidar observations. Uniform weights w_t=1; momentum-actor KL regularization.
 W&B logging defaults to online. Evaluation uses the standard SAC-Lag evaluator
 on held-out nominal environments (not the selected training trajectories).
 """

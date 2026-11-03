@@ -46,6 +46,7 @@ srun python -u scripts/train_nominal_hazard_bc.py \
   --batch-size 256 \
   --learning-rate 1e-4 \
   --kl-weight 1.0 \
+  --teacher-momentum 0.99 \
   --reward-margin 1.0 \
   --cost-margin 0.5 \
   --eval-episodes 128 \

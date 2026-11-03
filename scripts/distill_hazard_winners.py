@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
+from types import SimpleNamespace
 os.environ.setdefault('MUJOCO_GL', 'cgl' if sys.platform == 'darwin' else 'egl')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import jax
@@ -16,10 +18,35 @@ import numpy as np
 import optax
 from crax import envs
 from scripts.counterpol_hazard import load_actor
-from scripts.compare_fake_real_hazard import choose_hazard, unwrap, rollout as comparison_rollout
+from scripts.compare_fake_real_hazard import choose_hazard, unwrap
 from training.agents.sac import networks, checkpoint as checkpoint_io
 from training import acting
 from crax.envs.wrappers import training as wrappers
+
+
+def momentum_update(teacher, student, decay):
+    """EMA target actor, detached from student gradient computations."""
+    return jax.tree_util.tree_map(
+        lambda t, s: jax.lax.stop_gradient(decay * t + (1. - decay) * s),
+        teacher, student)
+
+
+def make_rollout(policy, step_fn, horizon):
+    """Compile once; retain only arrays needed for placement and imitation."""
+    @jax.jit
+    def collect(initial, params, root, radius):
+        def body(state, t):
+            action = policy(params, state.obs, jax.random.fold_in(root, t))
+            valid = ~state.done.astype(bool)
+            successor = jax.lax.cond(valid, lambda s: step_fn(s, action, radius), lambda s:s, state)
+            ps = state.pipeline_state
+            return successor, (ps.q, ps.qd, ps.x.pos, state.obs, action,
+                               jnp.where(valid, successor.reward, 0.),
+                               jnp.where(valid, successor.info['cost'], 0.), valid)
+        final, data = jax.lax.scan(body, initial, jnp.arange(horizon))
+        ps = final.pipeline_state
+        return data, (ps.q, ps.qd, ps.x.pos)
+    return collect
 
 
 def main():
@@ -35,6 +62,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--learning-rate', type=float, default=1e-4)
     p.add_argument('--kl-weight', type=float, default=1.)
+    p.add_argument('--teacher-momentum', type=float, default=.99,
+                   help='EMA actor decay; 1 keeps the original actor as a fixed target')
     p.add_argument('--reward-margin', type=float, default=1.)
     p.add_argument('--cost-margin', type=float, default=.5)
     p.add_argument('--eval-episodes', type=int, default=16)
@@ -51,6 +80,8 @@ def main():
         p.error('Counts must be positive')
     if min(args.reward_margin, args.cost_margin, args.kl_weight) < 0:
         p.error('Margins and KL weight must be nonnegative')
+    if not 0 <= args.teacher_momentum <= 1:
+        p.error('--teacher-momentum must be between 0 and 1')
     if args.output.exists():
         p.error('Use a new output directory to preserve previous experiments')
     cfg, net, (norm, original) = load_actor(args.checkpoint.resolve())
@@ -65,6 +96,14 @@ def main():
                          name=args.wandb_name or args.output.name, mode=args.wandb_mode,
                          dir=str(args.output.resolve()),
                          config={k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()})
+    run_log.define_metric('collection/pair')
+    run_log.define_metric('collection/*', step_metric='collection/pair')
+    run_log.define_metric('update')
+    run_log.define_metric('train/*', step_metric='update')
+    run_log.define_metric('eval/*', step_metric='update')
+    print(f'W&B mode={args.wandb_mode}, run={run_log.url}, local logs={run_log.dir}', flush=True)
+    run_log.summary['phase'] = 'collection'
+    run_log.log({'collection/pair':0, 'collection/transitions':0})
     def log(values):
         run_log.log(values)
     env = envs.get_environment('safe_pathway_walker2d', level=args.level)
@@ -72,37 +111,47 @@ def main():
     real_env = envs.get_environment('safe_pathway_walker2d', level=args.level, num_hazards=base._num_hazards+1)
     real = unwrap(real_env)
     reset, real_reset = jax.jit(env.reset), jax.jit(real_env.reset)
-    step = jax.jit(env.step)
     radii = real._hazard_radii[:-1]
     infer = networks.make_inference_fn(net)
     policy = jax.jit(lambda params, obs, key: infer((norm, params), deterministic=False)(obs, key)[0])
 
-    def run(initial, params, root, step_fn, record=False):
+    def dynamic_real_step(state, action, radius):
+        # During tracing only, expose the runtime radius to the environment's
+        # cost calculation. Restore the Python attribute to avoid tracer leaks.
+        saved = real._hazard_radii
+        try:
+            real._hazard_radii = jnp.concatenate([radii, radius.reshape(1)])
+            return real_env.step(state, action)
+        finally:
+            real._hazard_radii = saved
+    step = make_rollout(policy, lambda s,a,r:env.step(s,a), args.steps)
+    real_step = make_rollout(policy, dynamic_real_step, args.steps)
+
+    def run(initial, params, root, collector, record=False, radius=.25):
+        data, final = jax.device_get(collector(initial, params, root, jnp.asarray(radius, dtype=jnp.float32)))
+        q, qd, xyz, obs, acts, rewards, costs, valid = data
+        n = int(valid.sum())
+        metrics = dict(reward=float(rewards.sum(dtype=np.float64)),
+                       cost=float(costs.sum(dtype=np.float64)), steps=n)
+        states = []
         if record:
-            keys = [jax.random.fold_in(root, t) for t in range(args.steps)]
-            actor = lambda obs, key: (policy(params, obs, key), {})
-            states = comparison_rollout(initial, keys, actor, step_fn)
-            obs = [np.asarray(s.obs) for s in states[:-1]]
-            actions = [np.asarray(policy(params, s.obs, key))
-                       for s, key in zip(states[:-1], keys)]
-            metrics = dict(reward=sum(float(s.reward) for s in states[1:]),
-                           cost=sum(float(s.info['cost']) for s in states[1:]), steps=len(actions))
-            return metrics, states, obs, actions
-        state = initial
-        states, obs, actions = [state], [], []
-        reward = cost = 0.
-        for t in range(args.steps):
-            action = policy(params, state.obs, jax.random.fold_in(root, t))
-            if record:
-                obs.append(np.asarray(state.obs)); actions.append(np.asarray(action))
-            state = step_fn(state, action)
-            reward += float(state.reward); cost += float(state.info['cost'])
-            if record: states.append(state)
-            if bool(state.done): break
-        return dict(reward=reward, cost=cost, steps=t+1), states, obs, actions
+            info = jax.device_get(initial.info)
+            for values in list(zip(q[:n], qd[:n], xyz[:n])) + [final]:
+                ps = SimpleNamespace(q=values[0], qd=values[1], x=SimpleNamespace(pos=values[2]))
+                states.append(SimpleNamespace(pipeline_state=ps, info=info))
+        return metrics, states, obs[:n], acts[:n]
+
+    @jax.jit
+    def relabel_batch(q, qd, xyz, positions):
+        def one(q, qd, xyz):
+            ps = SimpleNamespace(q=q, qd=qd, x=SimpleNamespace(pos=xyz))
+            return real._get_obs(ps, positions)
+        return jax.vmap(one)(q, qd, xyz)
 
     records, observations, actions, anchors = [], [], [], []
+    print('Collecting compiled rollouts; the first nominal and real rollouts require compilation.', flush=True)
     for i in range(args.pairs):
+        pair_started = time.perf_counter()
         seed = args.seed+i
         rk, ak = jax.random.split(jax.random.PRNGKey(seed))
         initial = reset(rk)
@@ -111,17 +160,17 @@ def main():
             pos, radius = choose_hazard(base, states, np.random.default_rng(np.random.SeedSequence([args.hazard_seed, i])))
         except ValueError as error:
             records.append(dict(seed=seed, skipped=str(error)))
+            log({'collection/pair':i+1, 'collection/skipped':1,
+                 'collection/accepted':0, 'collection/transitions':len(actions)})
             print(f'Pair {i+1}: skipped ({error})', flush=True)
             continue
-        real._hazard_radii = jnp.concatenate([radii, jnp.array([radius])])
         ri = real_reset(rk)
         np.testing.assert_allclose(ri.pipeline_state.q, initial.pipeline_state.q)
         positions = jnp.concatenate([initial.info['hazard_positions'], jnp.asarray(pos[None])])
         ps = ri.pipeline_state.replace(mocap_pos=ri.pipeline_state.mocap_pos.at[jnp.array(real._hazard_mocap_ids)].set(positions))
         ri = ri.replace(pipeline_state=ps, obs=real._get_obs(ps, positions),
                         info=dict(ri.info, hazard_positions=positions))
-        real_step = jax.jit(lambda s, a: real_env.step(s, a))
-        rm, _, ro, ra = run(ri, original, ak, real_step, True)
+        rm, _, ro, ra = run(ri, original, ak, real_step, True, radius)
         def wins(a, b):
             return a['reward'] > b['reward'] + args.reward_margin and a['cost'] < b['cost'] - args.cost_margin
         winner = 'nominal' if wins(nm, rm) else 'real' if wins(rm, nm) else None
@@ -132,10 +181,15 @@ def main():
             if args.nominal_relabel:
                 # Same physical states and sampled actions; only hazard sensing
                 # changes. Exclude the terminal successor (no action target).
-                relabel = jax.jit(lambda ps: real._get_obs(ps, positions))
-                rebuilt = [np.asarray(relabel(s.pipeline_state)) for s in states[:-1]]
-                probe = jax.jit(lambda ps: real._calculate_hazard_penetration(ps, positions)[-1])
-                assert all(float(probe(s.pipeline_state)) == 0. for s in states)
+                # Pad to the fixed rollout horizon to reuse one compiled relabeler.
+                physical = states[:-1] + [states[-1]] * (args.steps-len(na))
+                rebuilt = np.asarray(relabel_batch(
+                    jnp.asarray(np.stack([s.pipeline_state.q for s in physical])),
+                    jnp.asarray(np.stack([s.pipeline_state.qd for s in physical])),
+                    jnp.asarray(np.stack([s.pipeline_state.x.pos for s in physical])), positions))[:len(na)]
+                feet = np.stack([s.pipeline_state.x.pos[base._foot_link_ids] for s in states])
+                grounded = feet[...,2] < real._hazard_height*2+.08
+                assert not np.any(grounded & (np.linalg.norm(feet[...,:2]-pos[:2],axis=-1) < radius))
                 assert len(rebuilt) == len(na)
                 observations.extend(rebuilt)
                 actions.extend(na)
@@ -143,11 +197,11 @@ def main():
                 observations.extend(no if winner == 'nominal' else ro)
                 actions.extend(na if winner == 'nominal' else ra)
             anchors.extend(no); anchors.extend(ro)
-        log({'collection/pair':i+1, 'collection/accepted':int(accepted),
+        log({'collection/pair':i+1, 'collection/skipped':0, 'collection/accepted':int(accepted),
              'collection/nominal_reward':nm['reward'], 'collection/real_reward':rm['reward'],
              'collection/nominal_cost':nm['cost'], 'collection/real_cost':rm['cost'],
-             'collection/transitions':len(actions)})
-        print(f'Pair {i+1}/{args.pairs}: winner={winner}, nominal={nm}, real={rm}', flush=True)
+             'collection/transitions':len(actions), 'collection/pair_seconds':time.perf_counter()-pair_started})
+        print(f'Pair {i+1}/{args.pairs}: winner={winner}, nominal={nm}, real={rm}, elapsed={time.perf_counter()-pair_started:.2f}s', flush=True)
     report = dict(method='nominal-winner BC on hazard-visible observations (uniform weights)' if args.nominal_relabel else 'winner-filtered imitation, not SDPO', configuration={k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()}, pairs=records)
     report_path = args.output/'report.json'
     report_path.write_text(json.dumps(report, indent=2))
@@ -160,20 +214,25 @@ def main():
     np.savez_compressed(args.output/'winner_data.npz', observations=x, actions=a)
     optimizer = optax.chain(optax.clip_by_global_norm(1.), optax.adam(args.learning_rate))
     params, opt_state = original, optimizer.init(original)
+    teacher = original
+    run_log.summary['phase'] = 'training'
     distribution = net.parametric_action_distribution
-    def loss(params, obs, acts, reference_obs):
+    def loss(params, teacher, obs, acts, reference_obs):
         logits = net.policy_network.apply(norm, params, obs)
         raw_actions = distribution.inverse_postprocess(jnp.clip(acts, -1+1e-6, 1-1e-6))
         nll = -jnp.mean(distribution.log_prob(logits, raw_actions))
-        old = distribution.create_dist(net.policy_network.apply(norm, original, reference_obs))
+        target = jax.lax.stop_gradient(net.policy_network.apply(norm, teacher, reference_obs))
+        old = distribution.create_dist(target)
         new = distribution.create_dist(net.policy_network.apply(norm, params, reference_obs))
         kl = jnp.mean(jnp.sum(jnp.log(new.scale/old.scale) + (old.scale**2+(old.loc-new.loc)**2)/(2*new.scale**2)-.5, axis=-1))
         return nll+args.kl_weight*kl, (nll, kl)
     @jax.jit
-    def update(params, opt_state, obs, acts, ref):
-        (value, metrics), grad = jax.value_and_grad(loss, has_aux=True)(params, obs, acts, ref)
+    def update(params, teacher, opt_state, obs, acts, ref):
+        (value, metrics), grad = jax.value_and_grad(loss, has_aux=True)(params, teacher, obs, acts, ref)
         updates, opt_state = optimizer.update(grad, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, value, metrics
+        params = optax.apply_updates(params, updates)
+        teacher = momentum_update(teacher, params, args.teacher_momentum)
+        return params, teacher, opt_state, value, metrics
     rng = np.random.default_rng(args.seed)
     history = []
     # Same wrapper and Evaluator used by SAC-Lag training. Reuse held-out
@@ -194,10 +253,10 @@ def main():
     for i in range(args.updates):
         ids = rng.integers(len(x), size=args.batch_size)
         refs = rng.integers(len(anchor), size=args.batch_size)
-        params, opt_state, value, (nll, kl) = update(params, opt_state, x[ids], a[ids], anchor[refs])
+        params, teacher, opt_state, value, (nll, kl) = update(params, teacher, opt_state, x[ids], a[ids], anchor[refs])
         if not np.isfinite(float(value)): raise RuntimeError('Nonfinite training loss; checkpoint not saved')
         history.append(dict(update=i+1, loss=float(value), nll=float(nll), kl=float(kl)))
-        log(dict(update=i+1, **{'train/loss':float(value), 'train/bc_nll':float(nll), 'train/reference_kl':float(kl)}))
+        log(dict(update=i+1, **{'train/loss':float(value), 'train/bc_nll':float(nll), 'train/momentum_teacher_kl':float(kl)}))
         if (i+1) % args.eval_every == 0 or i+1 == args.updates:
             evaluate(params, i+1)
     evaluation = []
@@ -222,6 +281,7 @@ def main():
     print(json.dumps(aggregate, indent=2), flush=True)
     print(f'Saved and verified checkpoint: {saved}', flush=True)
     run_log.summary['saved_checkpoint'] = str(saved)
+    run_log.summary['phase'] = 'complete'
     run_log.summary['accepted_pairs'] = sum(r.get('accepted', False) for r in records)
     run_log.finish()
 
