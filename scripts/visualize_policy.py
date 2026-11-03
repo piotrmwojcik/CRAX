@@ -63,10 +63,36 @@ from training.agents.ppo import checkpoint as ppo_checkpoint
 
 
 def load_policy(checkpoint_path: str, deterministic: bool = True):
-    """Load a trained policy from a checkpoint."""
+    """Load PPO or SAC/SAC-Lag from a checkpoint or run directory."""
+    import importlib.util
+
     root_dir = Path(__file__).parent.parent.resolve()
-    path = root_dir / "models" / checkpoint_path
-    return ppo_checkpoint.load_policy(path)
+    path = Path(checkpoint_path).expanduser()
+    if not path.exists():
+        path = root_dir / "models" / path
+    path = path.resolve()
+    config_names = ("sac_network_config.json", "ppo_network_config.json")
+
+    def has_config(directory):
+        return any((directory / name).exists() for name in config_names)
+
+    if not has_config(path) and not has_config(path / "~"):
+        steps = [p for p in path.iterdir() if p.is_dir() and p.name.isdigit()]
+        if steps:
+            path = max(steps, key=lambda p: int(p.name))
+    if not has_config(path) and has_config(path / "~"):
+        path = path / "~"
+    if (path / "sac_network_config.json").exists():
+        # Explicit CPU restore supports checkpoints saved with GPU sharding.
+        spec = importlib.util.spec_from_file_location(
+            "checkpoint_renderer", root_dir / "examples/02_render_checkpoint.py"
+        )
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        return renderer.load_checkpoint_policy(path, deterministic=deterministic)
+    if (path / "ppo_network_config.json").exists():
+        return ppo_checkpoint.load_policy(path, deterministic=deterministic)
+    raise ValueError(f"No PPO or SAC network configuration found in {path}")
 
 
 def make_random_policy(action_size: int):
@@ -184,6 +210,9 @@ def run_rollout(
             'reward': episode_reward,
             'cost': episode_cost,
             'length': episode_steps,
+            'end_reason': ('unhealthy termination' if bool(state.info.get('unhealthy_termination', False))
+                           else 'environment done' if bool(state.done) else 'step limit reached'),
+            'terminal_cost': float(state.metrics.get('terminal_cost', 0.0)),
         })
 
         print(f"  Episode {ep + 1}/{num_episodes}: "
@@ -205,6 +234,7 @@ def save_video(
         show_metrics: bool = True,
         font: str = "DejaVuSans-Bold",
         font_size: int = 20,
+        episode_metrics=None,
 ):
     """Save a video of the trajectory with optional metric overlay."""
     # Get pipeline states for rendering
@@ -233,11 +263,11 @@ def save_video(
             draw = ImageDraw.Draw(img)
 
             # Metrics for current frame (skip first state which is reset state)
-            if i > 0 and i - 1 < len(rewards_per_step):
+            if i < len(rewards_per_step):
                 # rewards_per_step and costs_per_step are 0-indexed for steps,
                 # but states is 0-indexed for states (includes initial state), so offset
-                _, r_cum = rewards_per_step[i - 1]
-                _, c_cum = costs_per_step[i - 1]
+                _, r_cum = rewards_per_step[i]
+                _, c_cum = costs_per_step[i]
             else:
                 r_cum = 0.0
                 c_cum = 0.0
@@ -252,6 +282,33 @@ def save_video(
             frames_to_write.append(np.array(img))
     else:
         frames_to_write = frames_np
+
+    # End cards remain visible even when the optional running overlay is off.
+    if episode_metrics:
+        end_frames = {}
+        offset = 0
+        for metrics in episode_metrics:
+            offset += metrics['length'] + 1  # includes each reset frame
+            end_frames[offset - 1] = metrics
+        annotated = []
+        card_font = ImageFont.load_default(size=20)
+        for i, frame in enumerate(frames_to_write):
+            if i not in end_frames:
+                annotated.append(frame)
+                continue
+            metrics = end_frames[i]
+            img = Image.fromarray(np.asarray(frame).astype(np.uint8))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle((0, height - 115, width, height), fill=(20, 20, 20))
+            draw.multiline_text(
+                (12, height - 105),
+                f"EPISODE {metrics['episode']} ENDED: {metrics['end_reason']}\n"
+                f"Steps: {metrics['length']} | Total cost: {metrics['cost']:.3f}\n"
+                f"Terminal cost: {metrics['terminal_cost']:.3f} (included in total)",
+                font=card_font, fill=(255, 180, 60), spacing=8,
+            )
+            annotated.extend([np.asarray(img)] * (1 + max(1, round(2 * fps))))
+        frames_to_write = annotated
 
     # Save as mp4
     print(f"Saving video to {output_path}...")
@@ -312,8 +369,8 @@ def save_snapshots(
 
             # Get cumulative metrics for this frame
             if idx > 0 and idx - 1 < len(rewards_per_step):
-                _, r_cum = rewards_per_step[idx - 1]
-                _, c_cum = costs_per_step[idx - 1]
+                _, r_cum = rewards_per_step[idx]
+                _, c_cum = costs_per_step[idx]
             else:
                 r_cum = 0.0
                 c_cum = 0.0
@@ -448,12 +505,19 @@ def main():
 
     # Save video
     if not args.no_video:
-        video_path = output_dir / f"{name}.mp4"
-        save_video(
-            env, states, all_rewards_per_step, all_costs_per_step, str(video_path), fps=args.video_fps,
-            width=args.width, height=args.height, camera=args.camera, show_metrics=args.show_metrics, font=args.font,
-            font_size=args.font_size
-        )
+        offset = 0
+        for metrics in episode_metrics:
+            count = metrics['length'] + 1  # reset state plus transitions
+            end = offset + count
+            video_path = output_dir / f"{name}_episode_{metrics['episode']:02d}.mp4"
+            save_video(
+                env, states[offset:end], all_rewards_per_step[offset:end],
+                all_costs_per_step[offset:end], str(video_path), fps=args.video_fps,
+                width=args.width, height=args.height, camera=args.camera,
+                show_metrics=args.show_metrics, font=args.font,
+                font_size=args.font_size, episode_metrics=[metrics]
+            )
+            offset = end
 
     # Save snapshots
     if not args.no_snapshots:

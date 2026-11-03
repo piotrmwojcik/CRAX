@@ -24,13 +24,24 @@ from training.agents.sac import networks as sac_networks
 
 
 def load_checkpoint_policy(checkpoint_dir, deterministic):
-    """Restore the policy onto the current device, even from a GPU checkpoint."""
+    """Restore a plain or cost-conditioned actor on CPU from any device.
+
+    Inference checkpoints contain only the normalizer and actor parameters.
+    Cost-conditioned policies use the checkpoint's nominal cost parameters;
+    neither reward nor cost critic parameters are required for rendering.
+    """
     config = generic_checkpoint.load_config(
         str(checkpoint_dir / "sac_network_config.json")
     )
-    network = generic_checkpoint.get_network(
-        config, sac_networks.make_sac_networks
-    )
+    if config.get("cost_conditioning", False):
+        from training.agents.sac_lag import networks as lag_networks
+
+        network_factory = lag_networks.make_cost_conditioned_networks
+        inference_factory = lag_networks.make_inference_fn
+    else:
+        network_factory = sac_networks.make_sac_networks
+        inference_factory = sac_networks.make_inference_fn
+    network = generic_checkpoint.get_network(config, network_factory)
     normalizer = running_statistics.init_state(
         specs.Array((config.observation_size,), jnp.dtype("float32"))
     )
@@ -47,7 +58,7 @@ def load_checkpoint_policy(checkpoint_dir, deterministic):
         str(checkpoint_dir),
         args=ocp.args.PyTreeRestore(item=target, restore_args=restore_args),
     )
-    make_inference_fn = sac_networks.make_inference_fn(network)
+    make_inference_fn = inference_factory(network)
     return make_inference_fn(restored, deterministic=deterministic)
 
 
