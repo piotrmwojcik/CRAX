@@ -59,6 +59,8 @@ def choose_hazard(
     rng,
     clearance=0.02,
     min_half_length=0.03,
+    randomize=False,
+    count=None,
 ):
     """
     Find the widest available interval along x that does
@@ -71,6 +73,12 @@ def choose_hazard(
     Returns:
         position: [x, y, z]
         half_length: half-length of the hazard along x
+
+    With randomize=True, sample a feasible gap, size, and center instead
+    of always filling the widest gap.
+    With count set, fill the widest distinct safe gaps to maximize total
+    hazard length, retaining clearance and a numerical boundary margin.
+    Randomness only breaks width ties. Raise ValueError if too few gaps exist.
     """
 
     # Extract foot positions across the nominal trajectory.
@@ -201,6 +209,32 @@ def choose_hazard(
     if not gaps:
         raise ValueError("No safe between-footsteps interval " "for a full-width box")
 
+    if count is not None:
+        if count < 1:
+            raise ValueError('Hazard count must be positive')
+        if len(gaps) < count:
+            raise ValueError(f'Only {len(gaps)} safe gaps available for {count} hazards')
+        # Sort a random permutation stably so equally wide gaps use the seed,
+        # while the chosen set maximizes total length across distinct gaps.
+        selected = sorted(rng.permutation(len(gaps)),
+                          key=lambda index: gaps[index][1] - gaps[index][0],
+                          reverse=True)[:count]
+        positions, sizes = [], []
+        for index in selected:
+            left, right = gaps[index]
+            size = float((right - left) / 2 - 1e-5)
+            center = float((left + right) / 2)
+            positions.append([center, 0.0, float(base._hazard_height)])
+            sizes.append(size)
+        return np.asarray(positions), np.asarray(sizes)
+
+    if randomize:
+        left, right = gaps[int(rng.integers(len(gaps)))]
+        maximum = (right - left) / 2 - 1e-5
+        half_length = float(rng.uniform(min(min_half_length, maximum), maximum))
+        center_x = float(rng.uniform(left + half_length, right - half_length))
+        return np.array([center_x, 0.0, float(base._hazard_height)]), half_length
+
     # Select the widest feasible gap.
     width = max(right - left for left, right in gaps)
 
@@ -267,34 +301,18 @@ def render(
 
     scene = renderer.scene
 
-    if scene.ngeom >= scene.maxgeom:
-        raise RuntimeError("No free rendering geom slot")
-
-    # Nominal hazard:
-    # BLUE rectangle spanning the platform width.
-    #
-    # This is only a rendering geometry.
-    # It does not affect the nominal simulation.
-
-    mujoco.mjv_initGeom(
-        scene.geoms[scene.ngeom],
-        mujoco.mjtGeom.mjGEOM_BOX,
-        np.array(
-            [
-                radius,
-                platform_half_width,
-                position[2],
-            ]
-        ),
-        position,
-        np.eye(3).ravel(),
-        np.array(
-            [0.0, 0.25, 1.0, 1.0],
-            dtype=np.float32,
-        ),
-    )
-
-    scene.ngeom += 1
+    positions = np.atleast_2d(position)
+    radii = np.atleast_1d(radius)
+    if scene.ngeom + len(positions) > scene.maxgeom:
+        raise RuntimeError("No free rendering geom slots")
+    for center, half_length in zip(positions, radii, strict=True):
+        mujoco.mjv_initGeom(
+            scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_BOX,
+            np.array([half_length, platform_half_width, center[2]]),
+            center, np.eye(3).ravel(),
+            np.array([0.0, 0.25, 1.0, 1.0], dtype=np.float32),
+        )
+        scene.ngeom += 1
 
     return renderer.render().copy()
 
@@ -372,7 +390,11 @@ def main():
         default=Path("visualizations/fake_real_hazard"),
     )
 
+    p.add_argument('--num-added-hazards', type=int, default=1,
+                   help='Number of simultaneous blue/orange hazards per episode pair')
     args = p.parse_args()
+    if args.num_added_hazards < 1:
+        p.error('--num-added-hazards must be positive')
 
     if args.platform_half_width <= 0:
         p.error("--platform-half-width must be positive")
@@ -396,11 +418,11 @@ def main():
         level=args.level,
     )
 
-    # Real: original hazards + one added hazard.
+    # Real: original hazards + the requested added hazards.
     real_env = envs.get_environment(
         "safe_pathway_walker2d",
         level=args.level,
-        num_hazards=(unwrap(nominal_env)._num_hazards + 1),
+        num_hazards=(unwrap(nominal_env)._num_hazards + args.num_added_hazards),
     )
 
     base = unwrap(nominal_env)
@@ -410,33 +432,20 @@ def main():
     # Configure added REAL hazard as a rectangular box.
     # --------------------------------------------------------
 
-    original_radii = real._hazard_radii[:-1]
-    original_extents = real._hazard_half_extents[:-1]
+    original_radii = real._hazard_radii[:-args.num_added_hazards]
+    original_extents = real._hazard_half_extents[:-args.num_added_hazards]
 
     platform_half_width = args.platform_half_width
 
-    real._hazard_is_rect = real._hazard_is_rect.at[-1].set(True)
-
+    real._hazard_is_rect = real._hazard_is_rect.at[-args.num_added_hazards:].set(True)
     real_model = real_env.sys.mj_model
-
-    body = mujoco.mj_name2id(
-        real_model,
-        mujoco.mjtObj.mjOBJ_BODY,
-        f"hazard{real._num_hazards}",
-    )
-
-    geom = int(real_model.body_geomadr[body])
-
-    # Real hazard is a BOX, not a cylinder.
-    real_model.geom_type[geom] = mujoco.mjtGeom.mjGEOM_BOX
-
-    # Orange.
-    real_model.geom_rgba[geom] = [
-        1.0,
-        0.5,
-        0.0,
-        1.0,
-    ]
+    added_geoms = []
+    for hazard_id in range(base._num_hazards + 1, real._num_hazards + 1):
+        body = mujoco.mj_name2id(real_model, mujoco.mjtObj.mjOBJ_BODY, f'hazard{hazard_id}')
+        geom = int(real_model.body_geomadr[body])
+        added_geoms.append(geom)
+        real_model.geom_type[geom] = mujoco.mjtGeom.mjGEOM_BOX
+        real_model.geom_rgba[geom] = [1.0, 0.5, 0.0, 1.0]
 
     real_reset = jax.jit(real_env.reset)
 
@@ -522,11 +531,12 @@ def main():
             # ------------------------------------------------
 
             try:
-                position, radius = choose_hazard(
-                    base,
-                    nominal,
-                    placement_rng,
-                )
+                if args.num_added_hazards == 1:
+                    position, radius = choose_hazard(base, nominal, placement_rng)
+                    added_positions, added_radii = position[None], np.asarray([radius])
+                else:
+                    added_positions, added_radii = choose_hazard(
+                        base, nominal, placement_rng, count=args.num_added_hazards)
 
             except ValueError as error:
                 print(
@@ -538,6 +548,7 @@ def main():
                     dict(
                         episode=ep + 1,
                         status="skipped",
+                        num_added_hazards=args.num_added_hazards,
                         reason=str(error),
                         seed=args.seed,
                         hazard_seed=args.hazard_seed,
@@ -554,14 +565,9 @@ def main():
 
                 continue
 
-            print(
-                f"Episode {ep+1}: "
-                f"hazard x={position[0]:.4f}, "
-                f"half-length={radius:.4f}, "
-                f"full-length={2*radius:.4f}, "
-                f"full-width={2*platform_half_width:.4f}",
-                flush=True,
-            )
+            print(f'Episode {ep+1}: {args.num_added_hazards} added hazards; '
+                  f'x={added_positions[:, 0].tolist()}, '
+                  f'half-lengths={added_radii.tolist()}', flush=True)
 
             # ------------------------------------------------
             # Step 3: Nominal rollout metrics.
@@ -632,43 +638,18 @@ def main():
             # Step 4: Apply identical rectangle in REAL env.
             # ------------------------------------------------
 
-            # A rectangular hazard uses half-extents.
-            real._hazard_radii = jnp.concatenate(
-                [
-                    original_radii,
-                    jnp.array([0.0]),
-                ]
-            )
-
-            real._hazard_half_extents = jnp.concatenate(
-                [
-                    original_extents,
-                    jnp.array(
-                        [
-                            [
-                                radius,
-                                platform_half_width,
-                            ]
-                        ]
-                    ),
-                ],
-                axis=0,
-            )
-
-            # The MuJoCo rendering geometry matches
-            # the nominal overlay exactly.
-            real_model.geom_size[geom, :3] = [
-                radius,
-                platform_half_width,
-                real._hazard_height,
-            ]
-
-            positions = jnp.concatenate(
-                [
-                    initial.info["hazard_positions"],
-                    jnp.asarray(position[None]),
-                ]
-            )
+            # Match all active rectangles to the blue nominal overlays.
+            real._hazard_radii = jnp.concatenate([
+                original_radii, jnp.zeros(args.num_added_hazards)])
+            added_extents = np.column_stack([
+                added_radii, np.full(args.num_added_hazards, platform_half_width)])
+            real._hazard_half_extents = jnp.concatenate([
+                original_extents, jnp.asarray(added_extents)], axis=0)
+            for geom, half_length in zip(added_geoms, added_radii, strict=True):
+                real_model.geom_size[geom, :3] = [
+                    half_length, platform_half_width, real._hazard_height]
+            positions = jnp.concatenate([
+                initial.info['hazard_positions'], jnp.asarray(added_positions)])
 
             info = dict(
                 initial.info,
@@ -732,7 +713,7 @@ def main():
                     real._calculate_hazard_penetration(
                         ps,
                         positions,
-                    )[-1]
+                    )[-args.num_added_hazards:].max()
                 )
             )
 
@@ -758,18 +739,18 @@ def main():
             ]
 
             added_cost = sum(
-                float(s.info["hazard_penetration"][-1]) ** 2 * real._cost_scaler
+                float(jnp.sum(s.info["hazard_penetration"][-args.num_added_hazards:] ** 2)) * real._cost_scaler
                 for s in adapted[1:]
             )
 
             record = dict(
                 episode=ep + 1,
-                position=position.tolist(),
-                radius=radius,
+                num_added_hazards=args.num_added_hazards,
+                positions=added_positions.tolist(),
+                radii=added_radii.tolist(),
                 half_extents=[
-                    radius,
-                    platform_half_width,
-                    float(real._hazard_height),
+                    [float(r), platform_half_width, float(real._hazard_height)]
+                    for r in added_radii
                 ],
                 seed=args.seed,
                 hazard_seed=args.hazard_seed,
@@ -789,7 +770,24 @@ def main():
                 real_added_hazard_cost=added_cost,
             )
 
+            reward_delta = record['nominal_reward'] - record['real_reward']
+            cost_delta = record['nominal_cost'] - record['real_cost']
+            winner = (
+                'nominal' if reward_delta > 0 and cost_delta < 0
+                else 'real' if reward_delta < 0 and cost_delta > 0
+                else 'none'
+            )
+            record['winner'] = winner
             records.append(record)
+
+            print(
+                f"Episode {ep+1}: winner={winner} | "
+                f"nominal reward={record['nominal_reward']:.6f}, "
+                f"cost={record['nominal_cost']:.6f} | "
+                f"real reward={record['real_reward']:.6f}, "
+                f"cost={record['real_cost']:.6f}",
+                flush=True,
+            )
 
             print(
                 json.dumps(record),
@@ -840,8 +838,8 @@ def main():
                             renderer,
                             nominal_env.sys.mj_model,
                             state,
-                            position,
-                            radius,
+                            added_positions,
+                            added_radii,
                             args.camera,
                             platform_half_width,
                         )
@@ -853,7 +851,7 @@ def main():
                             real_model,
                             state,
                             None,
-                            radius,
+                            added_radii,
                             args.camera,
                         )
 
@@ -886,7 +884,7 @@ def main():
                     draw.multiline_text(
                         (10, 8),
                         (
-                            f"Episode {ep+1}: {label}\n"
+                            f"Episode {ep+1}: {label} ({args.num_added_hazards} hazards)\n"
                             f"Step {j}/{len(trajectory)-1} "
                             f"| {status}\n"
                             f"Cost: {cumulative[side][j]:.3f} "
