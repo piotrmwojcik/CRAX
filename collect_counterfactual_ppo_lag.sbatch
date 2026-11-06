@@ -21,7 +21,7 @@ export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
-ppo_checkpoint="${PPO_CHECKPOINT:-/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_3_sac_seed0_20261030_141532_851541}"
+ppo_checkpoint="${PPO_CHECKPOINT:-/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_3_ppo_lag_seed3_20261106_154130_889149/000500170752}"
 ppo_output="${OUTPUT_DIR:-results/counterfactual_ppo_collection_${SLURM_JOB_ID}}"
 python -c "import jax; print(jax.devices()); assert len(jax.devices()) == 1 and jax.devices()[0].platform == 'gpu', 'One GPU required'"
 
