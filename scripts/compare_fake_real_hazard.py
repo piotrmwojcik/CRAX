@@ -212,13 +212,13 @@ def choose_hazard(
     if count is not None:
         if count < 1:
             raise ValueError('Hazard count must be positive')
-        if len(gaps) < count:
-            raise ValueError(f'Only {len(gaps)} safe gaps available for {count} hazards')
+        # The requested count is a cap. Use every feasible gap up to that cap;
+        # each selected obstacle fills its gap to the largest safe half-length.
         # Sort a random permutation stably so equally wide gaps use the seed,
         # while the chosen set maximizes total length across distinct gaps.
         selected = sorted(rng.permutation(len(gaps)),
                           key=lambda index: gaps[index][1] - gaps[index][0],
-                          reverse=True)[:count]
+                          reverse=True)[:min(count, len(gaps))]
         positions, sizes = [], []
         for index in selected:
             left, right = gaps[index]
