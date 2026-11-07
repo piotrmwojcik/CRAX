@@ -38,6 +38,6 @@ srun python -u -m training.agents.counterfactual.collect_rollouts \
   --batch-size 1024 \
   --num-minibatches 32 \
   --num-batches "${NUM_BATCHES:-1}" \
-  --num-added-hazards "${NUM_ADDED_HAZARDS:-1}" \
+  --num-added-hazards "${NUM_ADDED_HAZARDS:-3}" \
   --hazard-seed "${HAZARD_SEED:-42}" \
   --platform-half-width "${PLATFORM_HALF_WIDTH:-1.0}"

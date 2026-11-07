@@ -149,6 +149,15 @@ def compare_episodes(args, manifest, network, params):
                 positions, widths = choose_hazard(base, states,
                     np.random.default_rng(np.random.SeedSequence([args.hazard_seed, lane, episode_id])),
                     count=args.num_added_hazards)
+                placed_count = len(widths)
+                # Keep the compiled environment shape fixed at the requested cap.
+                # Unused slots have zero extent and sit beyond the whole rollout.
+                if placed_count < args.num_added_hazards:
+                    padding = args.num_added_hazards - placed_count
+                    off_path = float(physical['xyz'][:, 0, 0].max() + 100.)
+                    positions = np.concatenate([positions, np.tile(
+                        [off_path, 0., float(real._hazard_height)], (padding, 1))])
+                    widths = np.concatenate([widths, np.zeros(padding, dtype=widths.dtype)])
                 # Verify all recorded nominal states against the actual rectangular cost region.
                 feet = physical['xyz'][:, base._foot_link_ids]
                 delta = np.abs(feet[:, :, None, :2] - positions[None, None, :, :2])
@@ -185,7 +194,8 @@ def compare_episodes(args, manifest, network, params):
                 filename = f'real_rollouts/pair_{pair:06d}.npz'
                 np.savez_compressed(args.output / filename, **{k: v[:length] for k, v in result.items()})
                 row.update(status='compared', real=metrics, winner=winner,
-                           positions=positions.tolist(), half_lengths=widths.tolist(),
+                           positions=positions[:placed_count].tolist(), half_lengths=widths[:placed_count].tolist(),
+                           num_added_hazards=placed_count,
                            nominal_added_hazard_penetration=0., real_rollout=filename)
             rows.append(row)
             log.write(json.dumps(row) + '\n')
