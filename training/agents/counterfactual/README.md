@@ -36,7 +36,7 @@ NUM_BATCHES=10 NUM_ADDED_HAZARDS=4 sbatch collect_counterfactual_ppo_lag.sbatch
 
 Override `PPO_CHECKPOINT`, `LEVEL`, `SEED`, `OUTPUT_DIR`, `HAZARD_SEED`, or
 `PLATFORM_HALF_WIDTH` as needed. The default
-checkpoint is `/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_3_sac_seed0_20261030_141532_851541`.
+checkpoint is `/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_3_ppo_lag_seed3_20261106_154130_889149/000500170752`.
 Run directories resolve to the latest numeric checkpoint. SAC uses its original
 stochastic action distribution, with raw actions and log probabilities additionally
 recorded for paired comparisons. Collection still uses PPO's batching and wrappers;
@@ -120,3 +120,44 @@ supports state-based Walker2d policies and action repeat 1. Physical recording
 adds disk and memory use; each shard is processed once and completed episodes are
 released as they are compared. Pre-existing datasets without recorded physics
 cannot be used for this phase.
+
+### Nominal demonstrations with fake-hazard lidar
+
+Post-process a completed collection without loading a policy or stepping physics:
+
+```bash
+python -m training.agents.counterfactual.edit_lidar \
+  --dataset results/existing_collection \
+  --output results/existing_collection_fake_lidar \
+  --num-added-hazards 3 --hazard-seed 42
+```
+
+The input must have `collection_status: complete` and recorded physics in
+`initial_states.npz` and the transition batches. It can come from a run whose
+real-hazard comparison failed after collection completed. The output must be a
+new directory. Original batch shapes and all fields are preserved, except the
+lidar slices of `observation` and `next_observation`. Actions, policy log
+probabilities, rewards, costs, and physics remain those of the original rollout;
+these are imperfect expert demonstrations, not freshly sampled on-policy data.
+The initial-state file remains an unchanged record of the original physics.
+
+The editor selects up to the requested number of widest safe gaps per episode,
+using the same placement seed convention as hazard comparison. It uses the
+actual environment observation function, including nearest-hazard selection and
+lidar aliasing. Lidar detects hazard centers, as in the real environment; widths
+control placement safety but do not change lidar. With no safe gap, the episode
+is retained unchanged. `fake_hazards.jsonl` records placements or the reason no
+placement was possible. Observation physics is aligned across file boundaries;
+terminal next observations retain the collector's auto-reset semantics using
+the ending episode's fake hazards.
+
+The collection sbatch runs this edit after a successful collection/comparison.
+To skip collection and edit an existing dataset:
+
+```bash
+sbatch --export=ALL,DATASET_DIR=results/existing_collection,LIDAR_OUTPUT_DIR=results/existing_collection_fake_lidar collect_counterfactual_ppo_lag.sbatch
+```
+
+Alternatively use `SKIP_COLLECTION=1,OUTPUT_DIR=results/existing_collection`.
+`NUM_ADDED_HAZARDS` defaults to 3 and `HAZARD_SEED` to 42. Existing-dataset mode
+uses the environment and level from the source manifest and requires no checkpoint.
