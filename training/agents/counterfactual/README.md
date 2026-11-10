@@ -277,3 +277,29 @@ existing W&B setup. Override `WANDB_MODE`, `WANDB_PROJECT`, `WANDB_NAME`,
 The standard W&B `WANDB_ENTITY` and `WANDB_BASE_URL` settings are respected.
 Direct Python usage defaults to `--wandb-mode disabled`; use `--wandb-mode
 online --wandb-project crax` to enable uploading, or `offline` for local W&B logs.
+
+### Episode records, comparison bars, and final independent evaluation
+
+Each periodic evaluation now saves `evaluation/<iteration>/episodes.csv` with
+matched before/after reward, cost, and length for every episode. The initial
+actor's results are the baseline. Each directory also contains `summary.json`,
+`comparison.png`, and `comparison.pdf`. Summary intervals are 95% percentile
+bootstrap intervals from resampling matched episode pairs (2,000 resamples by
+default). Bar whiskers show uncertainty in mean episode reward/cost; the chart
+titles show paired changes and their intervals. These quantify episode sampling
+uncertainty for this run, not variability between independent training runs.
+
+W&B receives `eval/comparison` images and `eval/episode_results` tables at every
+evaluation, along with before/after/change means and CI endpoints. Aggregate
+curves remain available. Set `--eval-cost-limit` to show a specified episode-cost
+budget; no threshold is invented by default.
+
+After the last update, the original and final actors are evaluated on a separate
+set of 512 episodes with seed 60000, used only at the end. Results, intervals,
+and charts are saved under `independent_evaluation/` and uploaded under `test/*`.
+This compares the final actor, not the best actor selected from periodic scores.
+Configure via `--final-eval-episodes`, `--final-eval-seed`, and
+`--eval-bootstrap-samples`. Sbatch exposes `FINAL_EVAL_EPISODES` and
+`FINAL_EVAL_SEED`. Evaluation runs in batches of at most 32 environments to bound
+memory. Its key derivation has changed from the previous all-at-once evaluator,
+so new periodic curves use a different, consistently paired sample set.

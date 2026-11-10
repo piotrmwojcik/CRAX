@@ -34,6 +34,8 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --eval-every "${EVAL_EVERY:-10}" \
   --eval-episodes "${EVAL_EPISODES:-64}" \
   --eval-seed "${EVAL_SEED:-10000}" \
+  --final-eval-episodes "${FINAL_EVAL_EPISODES:-512}" \
+  --final-eval-seed "${FINAL_EVAL_SEED:-60000}" \
   --wandb-mode "${WANDB_MODE:-online}" \
   --wandb-project "${WANDB_PROJECT:-crax}" \
   --wandb-name "${WANDB_NAME:-soft-guidance-${SLURM_JOB_ID}}" \

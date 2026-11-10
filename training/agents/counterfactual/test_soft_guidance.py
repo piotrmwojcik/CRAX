@@ -1,5 +1,7 @@
 """Numerical checks for the constrained update and on-policy data path."""
 import unittest
+import tempfile
+from pathlib import Path
 import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -11,9 +13,22 @@ from training.agents.counterfactual.finetune_soft_guidance import make_rollout, 
 from training.agents.counterfactual.test_collect_rollouts import ToyEnv
 from training.agents.ppo.networks import make_ppo_networks
 from crax.envs.wrappers import training as wrappers
+from training.agents.counterfactual.evaluation_report import paired_statistics, save_report
 
 
 class SoftGuidanceTest(unittest.TestCase):
+    def test_paired_intervals_and_report(self):
+        before=np.array([[1.,2.,3.],[2.,10.,4.],[3.,0.,5.]])
+        after=before+np.array([2.,-1.,0.])
+        stats=paired_statistics(before,after,100)
+        np.testing.assert_allclose(stats['reward']['change']['ci95'],[2.,2.])
+        np.testing.assert_allclose(stats['cost']['change']['ci95'],[-1.,-1.])
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp)/'report'
+            save_report(directory,before,after,60000,10,100)
+            for name in ('episodes.csv','summary.json','comparison.png','comparison.pdf'):
+                self.assertGreater((directory/name).stat().st_size,0)
+
     def test_evaluation_is_repeatable_and_uses_episode_totals(self):
         net=make_ppo_networks(2,1,policy_hidden_layer_sizes=(8,),value_hidden_layer_sizes=(8,))
         actor=net.policy_network.init(jax.random.PRNGKey(1))

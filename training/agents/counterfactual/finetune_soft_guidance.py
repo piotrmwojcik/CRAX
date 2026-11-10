@@ -105,20 +105,26 @@ def make_update(network, normalizer, unravel):
     return jax.jit(measures), reward_grad, discrepancy_grad, hessian_product
 
 
-def evaluate_policy(rollout, actor, seed, episodes):
+def evaluate_policy(rollout, actor, seed, episodes, return_episodes=False):
     """Fixed independent random stream; does not consume training RNG."""
     started = time.perf_counter()
     key = jax.random.fold_in(jax.random.PRNGKey(seed), 1)
-    action_key, reset_key = jax.random.split(key)
-    data = jax.device_get(rollout(actor, action_key, jax.random.split(reset_key, episodes)))
+    batches = []
+    batch_size = min(episodes, 32)
+    for start in range(0, episodes, batch_size):
+        action_key, reset_key = jax.random.split(jax.random.fold_in(key, start))
+        data = jax.device_get(rollout(actor, action_key, jax.random.split(reset_key, batch_size)))
+        totals = np.column_stack([data['reward'].sum(0), data['cost'].sum(0), data['valid'].sum(0)])
+        batches.append(totals[:min(batch_size, episodes-start)])
+    totals = np.concatenate(batches)
     metrics = {'eval/episodes': episodes}
-    for name, values in (('reward', data['reward'].sum(0)),
-                         ('cost', data['cost'].sum(0)),
-                         ('episode_length', data['valid'].sum(0))):
-        metrics[f'eval/{name}'] = float(np.mean(values))
-        metrics[f'eval/{name}_std'] = float(np.std(values))
-    metrics['eval/zero_cost_fraction'] = float(np.mean(data['cost'].sum(0) == 0))
+    for i, name in enumerate(('reward', 'cost', 'episode_length')):
+        metrics[f'eval/{name}'] = float(np.mean(totals[:, i]))
+        metrics[f'eval/{name}_std'] = float(np.std(totals[:, i]))
+    metrics['eval/zero_cost_fraction'] = float(np.mean(totals[:, 1] == 0))
     metrics['eval/seconds'] = time.perf_counter()-started
+    if return_episodes:
+        return metrics, totals
     return metrics
 
 
@@ -146,6 +152,10 @@ def main():
     p.add_argument('--eval-every', type=int, default=10)
     p.add_argument('--eval-episodes', type=int, default=64)
     p.add_argument('--eval-seed', type=int, default=10000)
+    p.add_argument('--final-eval-episodes', type=int, default=512)
+    p.add_argument('--final-eval-seed', type=int, default=60000)
+    p.add_argument('--eval-bootstrap-samples', type=int, default=2000)
+    p.add_argument('--eval-cost-limit', type=float, default=None, help='Optional episode cost budget line on charts')
     p.add_argument('--wandb-mode', choices=('online', 'offline', 'disabled'), default='disabled')
     p.add_argument('--wandb-project', default='crax')
     p.add_argument('--wandb-entity', default=None)
@@ -156,6 +166,10 @@ def main():
                 args.initial_tolerance, args.max_kl, args.damping, args.eval_every, args.eval_episodes)
     if min(positive) <= 0 or not 0 < args.gamma <= 1 or args.annealing < 0:
         p.error('Counts and tolerances must be positive; 0 < gamma <= 1; annealing >= 0')
+    if min(args.eval_episodes, args.final_eval_episodes, args.eval_bootstrap_samples) < 2:
+        p.error('Evaluation episode counts and bootstrap samples must be at least 2')
+    if args.final_eval_seed == args.eval_seed:
+        p.error('Final evaluation seed must differ from periodic evaluation seed')
     manifest = json.loads((args.dataset/'manifest.json').read_text())
     if manifest.get('status') != 'complete' or not manifest.get('lidar_edit'):
         p.error('Provide a completed lidar-edited dataset')
@@ -201,6 +215,7 @@ def main():
                                 seed=args.eval_seed, episodes=args.eval_episodes,
                                 schedule='before training, every eval-every iterations, and final iteration',
                                 policy='stochastic')
+    report['evaluation']['final_test'] = dict(seed=args.final_eval_seed, episodes=args.final_eval_episodes)
     (args.output/'run.json').write_text(json.dumps(report, indent=2))
     np.savez(args.output/'mmd_features.npz', mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)
     tolerance = args.initial_tolerance
@@ -214,8 +229,34 @@ def main():
         run_log.define_metric('iteration')
         run_log.define_metric('train/*', step_metric='iteration')
         run_log.define_metric('eval/*', step_metric='iteration')
+        run_log.define_metric('test/*', step_metric='iteration')
+        from training.agents.counterfactual.evaluation_report import save_report, METRICS
+        evaluation_baseline = None
+        def publish_comparison(before, after, seed, iteration, namespace, directory):
+            summary = save_report(directory, before, after, seed, iteration,
+                                  args.eval_bootstrap_samples, args.eval_cost_limit)
+            table = wandb.Table(columns=['episode', 'eval_seed'] +
+                               [f'{side}_{m}' for side in ('before','after') for m in METRICS],
+                               data=[[i, seed, *b.tolist(), *a.tolist()]
+                                     for i,(b,a) in enumerate(zip(before,after))])
+            payload = {'iteration': iteration,
+                       f'{namespace}/comparison': wandb.Image(str(directory/'comparison.png')),
+                       f'{namespace}/episode_results': table}
+            for metric, values in summary['metrics'].items():
+                for label, value in values.items():
+                    prefix = f'{namespace}/{metric}_{label}'
+                    payload[prefix] = value['mean']
+                    payload[prefix+'_ci_low'], payload[prefix+'_ci_high'] = value['ci95']
+            run_log.log(payload)
+
         def evaluate(iteration):
-            metrics = evaluate_policy(rollout, unravel(theta), args.eval_seed, args.eval_episodes)
+            nonlocal evaluation_baseline
+            metrics, episodes = evaluate_policy(rollout, unravel(theta), args.eval_seed,
+                                                args.eval_episodes, return_episodes=True)
+            if evaluation_baseline is None:
+                evaluation_baseline = episodes.copy()
+            publish_comparison(evaluation_baseline, episodes, args.eval_seed, iteration, 'eval',
+                               args.output/'evaluation'/f'{iteration:06d}')
             record = dict(iteration=iteration, **metrics)
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
             run_log.log(record)
@@ -292,6 +333,16 @@ def main():
                 run_log.summary['saved_checkpoint'] = str((args.output/'checkpoint'/f'{iteration:012d}').resolve())
             if iteration % args.eval_every == 0 or iteration == args.iterations:
                 evaluate(iteration)
+        # Untouched test randomness, used only after training finishes. The
+        # original actor and final actor share reset/action keys for pairing.
+        _, test_before = evaluate_policy(rollout, actor, args.final_eval_seed,
+                                         args.final_eval_episodes, return_episodes=True)
+        test_metrics, test_after = evaluate_policy(rollout, unravel(theta), args.final_eval_seed,
+                                                   args.final_eval_episodes, return_episodes=True)
+        publish_comparison(test_before, test_after, args.final_eval_seed, args.iterations,
+                           'test', args.output/'independent_evaluation')
+        run_log.log({'iteration': args.iterations,
+                     **{k.replace('eval/', 'test/'): v for k,v in test_metrics.items()}})
     print(f'Saved fine-tuned checkpoint: {args.output}/checkpoint/{args.iterations:012d}',flush=True)
 
 
