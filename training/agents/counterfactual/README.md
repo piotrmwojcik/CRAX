@@ -161,3 +161,119 @@ sbatch --export=ALL,DATASET_DIR=results/existing_collection,LIDAR_OUTPUT_DIR=res
 Alternatively use `SKIP_COLLECTION=1,OUTPUT_DIR=results/existing_collection`.
 `NUM_ADDED_HAZARDS` defaults to 3 and `HAZARD_SEED` to 42. Existing-dataset mode
 uses the environment and level from the source manifest and requires no checkpoint.
+
+## Fine-tuning with imperfect nominal demonstrations
+
+`finetune_soft_guidance.py` implements the constrained policy update in
+[Jing et al., AAAI 2020](https://arxiv.org/abs/1911.07109), Algorithm 1 and
+Eqs. (3)--(9). All nominal episodes in the completed lidar-edited dataset are
+eligible demonstrations, including unchanged episodes with no feasible fake
+hazards. There is no winner filter, pairwise preference loss, behavior-cloning
+loss, or use of archived real rollouts as on-policy experience.
+
+```bash
+python -m training.agents.counterfactual.finetune_soft_guidance \
+  --dataset results/counterfactual_ppo_collection_28964946_fake_lidar \
+  --output results/soft_guidance_trial \
+  --iterations 100 --num-envs 16
+```
+
+The checkpoint defaults to `manifest.json`'s source checkpoint. Supply
+`--checkpoint /path/to/checkpoint` if that path moved. State-based PPO/PPO-Lag
+and plain SAC checkpoints supported by the collector are accepted. The actor
+is updated, the observation normalizer and any other checkpoint parameters
+remain frozen. Saved files preserve the original network configuration and
+checkpoint tuple layout and can be loaded by the existing policy loaders.
+This is an actor fine-tune, not a resumption of PPO/SAC optimizer state.
+
+Submit from CRAX (create `logs` first):
+
+```bash
+sbatch --export=ALL,DATASET_DIR=/gpfs/home2/pwojcik/CRAX/results/counterfactual_ppo_collection_28964946_fake_lidar \
+  finetune_soft_guidance.sbatch
+```
+
+### Objective and algorithm
+
+Each iteration collects fresh stochastic episodes in the standard real-hazard
+`safe_pathway_walker2d` environment at the manifest's level. It does not replay
+the original paired boards or add their episode-specific rectangles online.
+Only the first episode per lane contributes; terminal transitions are included
+and all post-termination samples are masked. The default horizon comes from the
+dataset. Native environment reward is the objective. Costs are logged but are
+**not constrained**: this implements soft expert guidance, not PPO-Lag's safety
+constraint, and does not promise lower cost.
+
+The update maximizes a local reward surrogate subject to an expert discrepancy
+bound and an old-to-new policy KL bound. It solves the local quadratic problem
+in the span of the two inverse-Fisher gradients (equivalent to the dual solution),
+uses conjugate gradients for Fisher-vector products, and backtracks to check
+empirical discrepancy and KL. An infeasible local problem uses a discrepancy
+recovery direction. Rejected proposals leave the actor unchanged. The expert
+tolerance grows as `d *= 1 + annealing` each iteration.
+
+### Explicit estimator choices
+
+This is a new implementation of the method, not a reproduction of the authors'
+experimental code. The paper leaves sampling/estimation details unspecified.
+Our choices are:
+
+- Squared, biased empirical Gaussian-kernel MMD on normalized discounted
+  state-action occupancies. `--initial-tolerance` is in **MMD squared** units.
+- Expert features are the saved edited observation and saved bounded action.
+  Original policy log probabilities/raw actions are not used as likelihoods
+  for these edited demonstrations. Saved rewards are not needed for guidance.
+- A bounded expert reservoir samples with weights `gamma**t`; uniform sampling
+  from that reservoir approximates the expert occupancy. Feature scaling is
+  frozen from this reservoir. Kernel width defaults to its median nonzero
+  pairwise distance; `--bandwidth` overrides it.
+- For a candidate actor, online MMD sample weights use the product of action
+  likelihood ratios from the start of an episode through each selected state
+  and action. This includes the effect of preceding actions on occupancy;
+  multiplying only the current action ratio would omit that effect. We use
+  normalized weights and a fixed sample set throughout each line search.
+- Reward gradients use discounted Monte Carlo returns, a leave-one-out
+  timestep baseline, and a likelihood-ratio surrogate. No critic is trained.
+- KL is analytic for the pre-tanh diagonal Gaussians (equivalently KL after
+  their common invertible tanh transformation), measured on sampled rollout
+  states. Fisher products include damping.
+
+MMD and KL checks are finite-sample local estimates, not guarantees on the true
+occupancy. Long trajectory importance weights can have high variance. Tune
+`--mmd-samples`, `--max-kl`, `--initial-tolerance`, and `--annealing` using held-out
+evaluation. The standard-environment rollouts logged each iteration are training
+data, not held-out evaluation or measurements on the original paired tasks.
+
+Outputs: `run.json` records configuration and estimator semantics;
+`mmd_features.npz` records frozen scaling/bandwidth; `metrics.jsonl` records
+reward, cost, valid length, MMD, tolerance, KL, recovery mode and accepted step;
+`checkpoint/<iteration>` stores loadable actor snapshots. Defaults save every
+10 iterations and at the end. Failed runs keep their prior snapshots; automatic
+resume of optimizer/RNG state is not implemented.
+
+### Evaluation and W&B
+
+Fine-tuning now evaluates the initial actor (iteration 0), every `--eval-every`
+iterations (default 10), and at the final iteration. Each evaluation runs
+`--eval-episodes` stochastic episodes (default 64) with fixed independent reset
+and action randomness controlled by `--eval-seed` (default 10000). These rollouts
+use the standard real-hazard environment at the dataset level, not archived
+paired boards; they are excluded from the training gradients and expert pool.
+Reusing the evaluation seeds supports before/after comparisons.
+
+W&B logs `eval/reward`, `eval/cost`, `eval/episode_length`, their population
+standard deviations, `eval/zero_cost_fraction`, episode count and evaluation
+wall time against `iteration`. Reward and cost are undiscounted episode totals,
+averaged over episodes, including the terminal transition. Training diagnostics
+use the separate `train/*` namespace. The latest evaluation and checkpoint path
+are recorded in the run summary. All evaluations also persist to
+`evaluation.jsonl`, including with W&B disabled. The W&B run is finalized by a
+context manager on normal exit or an exception.
+
+The sbatch defaults to W&B online in project `crax`, with run name
+`soft-guidance-<job_id>`. Authenticate on the cluster beforehand using the
+existing W&B setup. Override `WANDB_MODE`, `WANDB_PROJECT`, `WANDB_NAME`,
+`EVAL_EVERY`, `EVAL_EPISODES`, or `EVAL_SEED` via sbatch environment variables.
+The standard W&B `WANDB_ENTITY` and `WANDB_BASE_URL` settings are respected.
+Direct Python usage defaults to `--wandb-mode disabled`; use `--wandb-mode
+online --wandb-project crax` to enable uploading, or `offline` for local W&B logs.
