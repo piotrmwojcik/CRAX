@@ -21,7 +21,7 @@ export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
-ppo_checkpoint="${PPO_CHECKPOINT:-/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_3_ppo_lag_seed3_20261106_154130_889149/000500170752}"
+ppo_checkpoint="${PPO_CHECKPOINT:-/home/pwojcik/CRAX/models/safe_pathway_walker2d_Level_1_ppo_lag_seed1_20261105_232853_746828/000500170752}"
 ppo_output="${OUTPUT_DIR:-results/counterfactual_ppo_collection_${SLURM_JOB_ID}}"
 # DATASET_DIR selects an existing completed collection and skips collection.
 # LIDAR_OUTPUT_DIR selects the new augmented dataset directory.
