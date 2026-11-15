@@ -18,6 +18,49 @@ from training.agents.counterfactual.hazard_comparison import iter_episodes
 PREFIX = 'extras/state_extras/counterfactual_state/'
 
 
+def cached_placements(dataset, manifest, count, seed):
+    """Reuse a complete compatible comparison log; otherwise recompute."""
+    config = manifest['configuration']
+    path = dataset / 'hazard_comparisons.jsonl'
+    if (config.get('num_added_hazards') != count or config.get('hazard_seed') != seed
+            or not path.is_file()):
+        return None
+    placements, records = {}, []
+    try:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = (int(row['env_index']), int(row['episode_index']))
+            if key in placements or not 0 <= key[0] < config['num_envs'] or key[1] < 0:
+                return None
+            record = dict(env_index=key[0], episode_index=key[1])
+            if row['status'] == 'compared':
+                positions = np.asarray(row['positions'], dtype=float)
+                widths = np.asarray(row['half_lengths'], dtype=float)
+                if (positions.shape != (len(widths), 3) or not 0 < len(widths) <= count
+                        or not np.isfinite(positions).all() or not np.isfinite(widths).all()
+                        or np.any(widths <= 0)):
+                    return None
+                record.update(status='edited', positions=positions.tolist(), half_lengths=widths.tolist())
+            elif row['status'] == 'skipped':
+                positions = np.empty((0, 3))
+                record.update(status='unchanged', reason=row['reason'], positions=[], half_lengths=[])
+            else:
+                return None
+            placements[key] = positions
+            records.append(record)
+    except (ValueError, KeyError, TypeError):
+        return None
+    if len(records) != manifest['total_completed_episodes']:
+        return None
+    for lane in range(config['num_envs']):
+        ids = sorted(ep for ln, ep in placements if ln == lane)
+        if ids != list(range(len(ids))):
+            return None
+    return placements, records
+
+
 def edit_dataset(dataset, output, count=3, seed=42):
     dataset, output = Path(dataset).resolve(), Path(output).resolve()
     manifest = json.loads((dataset / 'manifest.json').read_text())
@@ -48,24 +91,30 @@ def edit_dataset(dataset, output, count=3, seed=42):
             return observer._get_obs(ps, positions)[-bins:]
         return jax.vmap(one)(q, qd, xyz)
 
-    placements, records = {}, []
-    for lane, episode_id, episode in iter_episodes(dataset, manifest):
-        physical = {name: np.concatenate([initials[name][lane:lane+1],
-                    episode[PREFIX + name]]) for name in ('q', 'qd', 'xyz')}
-        states = [SimpleNamespace(pipeline_state=SimpleNamespace(q=q, qd=qd,
-                  x=SimpleNamespace(pos=xyz)),
-                  info={'hazard_positions': initials['hazard_positions'][lane]})
-                  for q, qd, xyz in zip(physical['q'], physical['qd'], physical['xyz'])]
-        record = dict(env_index=lane, episode_index=episode_id)
-        try:
-            positions, widths = choose_hazard(base, states,
-                np.random.default_rng(np.random.SeedSequence([seed, lane, episode_id])), count=count)
-            record.update(status='edited', positions=positions.tolist(), half_lengths=widths.tolist())
-        except ValueError as error:
-            positions = np.empty((0, 3))
-            record.update(status='unchanged', reason=str(error), positions=[], half_lengths=[])
-        placements[lane, episode_id] = positions
-        records.append(record)
+    cached = cached_placements(dataset, manifest, count, seed)
+    if cached is not None:
+        placements, records = cached
+        print(f'Reusing hazard placements for {len(records)} episodes from hazard_comparisons.jsonl', flush=True)
+    else:
+        print('No complete compatible placement cache; computing placements.', flush=True)
+        placements, records = {}, []
+        for lane, episode_id, episode in iter_episodes(dataset, manifest):
+            physical = {name: np.concatenate([initials[name][lane:lane+1],
+                        episode[PREFIX + name]]) for name in ('q', 'qd', 'xyz')}
+            states = [SimpleNamespace(pipeline_state=SimpleNamespace(q=q, qd=qd,
+                      x=SimpleNamespace(pos=xyz)),
+                      info={'hazard_positions': initials['hazard_positions'][lane]})
+                      for q, qd, xyz in zip(physical['q'], physical['qd'], physical['xyz'])]
+            record = dict(env_index=lane, episode_index=episode_id)
+            try:
+                positions, widths = choose_hazard(base, states,
+                    np.random.default_rng(np.random.SeedSequence([seed, lane, episode_id])), count=count)
+                record.update(status='edited', positions=positions.tolist(), half_lengths=widths.tolist())
+            except ValueError as error:
+                positions = np.empty((0, 3))
+                record.update(status='unchanged', reason=str(error), positions=[], half_lengths=[])
+            placements[lane, episode_id] = positions
+            records.append(record)
     if len(records) != manifest['total_completed_episodes']:
         raise ValueError('Episode count does not match manifest')
 
@@ -76,6 +125,7 @@ def edit_dataset(dataset, output, count=3, seed=42):
     result['configuration']['output'] = str(output)
     result['lidar_edit'] = dict(source_dataset=str(dataset), max_added_hazards=count,
         seed=seed, placements='fake_hazards.jsonl', lidar_bins=bins,
+        placement_source='hazard_comparisons.jsonl' if cached is not None else 'computed',
         semantics='Only observation and next_observation lidar slices changed. Actions, rewards, costs, physics and policy extras retain original collection values. Terminal next_observation retains auto-reset semantics with the ending episode hazard placement.')
     (output / 'manifest.json').write_text(json.dumps(result, indent=2))
     shutil.copy2(dataset / 'initial_states.npz', output / 'initial_states.npz')

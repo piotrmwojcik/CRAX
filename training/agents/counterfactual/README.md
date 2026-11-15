@@ -303,3 +303,29 @@ Configure via `--final-eval-episodes`, `--final-eval-seed`, and
 `FINAL_EVAL_SEED`. Evaluation runs in batches of at most 32 environments to bound
 memory. Its key derivation has changed from the previous all-at-once evaluator,
 so new periodic curves use a different, consistently paired sample set.
+
+### Batched hazard comparison and placement reuse
+
+PHASE 2 now runs real-hazard branches in batches of 16 by default. Set
+`--comparison-batch-size` on `collect_rollouts.py`, or `COMPARISON_BATCH_SIZE`
+in the collection sbatch environment. Use a smaller value if GPU memory is
+limited. A final partial batch is padded internally; duplicate padding branches
+are never written or counted. Skipped episodes retain their log entries, and
+pair IDs, per-pair filenames, placement seeds and action-noise seeds remain
+unchanged. CPU placement and NPZ serialization are still sequential. Batching
+can change floating-point execution order, so bitwise-identical long physical
+trajectories across batching configurations are not guaranteed.
+
+```bash
+sbatch --export=ALL,LEVEL=1,COMPARISON_BATCH_SIZE=16,DATASET_DIR=,SKIP_COLLECTION=0 \
+  collect_counterfactual_ppo_lag.sbatch
+```
+
+The lidar editor automatically reuses `hazard_comparisons.jsonl` when it has one
+unique entry per episode and the requested hazard seed/count match the original
+configuration. Compared episodes reuse the exact stored positions and widths;
+skipped episodes remain unchanged. This avoids repeating the full episode
+assembly and CPU hazard-placement pass. Missing, incomplete, malformed, or
+incompatible caches fall back to placement computation. The edited manifest
+records `lidar_edit.placement_source`. Existing complete datasets can benefit
+without rerunning collection. Already-running jobs do not pick up these changes.

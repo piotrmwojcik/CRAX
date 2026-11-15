@@ -121,6 +121,10 @@ def compare_episodes(args, manifest, network, params):
                                       num_hazards=base._num_hazards + args.num_added_hazards))
     recover_noise, run = make_branch_runner(real, network, params, args.episode_length,
                                             args.num_added_hazards, args.platform_half_width)
+    batch_size = getattr(args, 'comparison_batch_size', 16)
+    if batch_size < 1:
+        raise ValueError('comparison_batch_size must be positive')
+    run_batch = jax.jit(jax.vmap(run))
     with np.load(args.output / 'initial_states.npz', allow_pickle=False) as file:
         initials = {key: file[key] for key in file.files}
     branch_dir = args.output / 'real_rollouts'
@@ -129,6 +133,39 @@ def compare_episodes(args, manifest, network, params):
     started = time.perf_counter()
     total = manifest['total_completed_episodes']
     print(f'PHASE 2 START: {total} episodes, {args.num_added_hazards} simultaneous hazards each.', flush=True)
+    pending = []
+    def flush(log):
+        active = [(row, inputs) for row, inputs in pending if inputs is not None]
+        results = {}
+        if active:
+            padded = active + [active[-1]] * (batch_size-len(active))
+            inputs = [jnp.stack([entry[1][i] for entry in padded]) for i in range(5)]
+            batched = jax.device_get(run_batch(*inputs))
+            for slot, (row, _) in enumerate(active):
+                results[row['pair']] = {k:v[slot] for k,v in batched.items()}
+        for row, inputs in pending:
+            if inputs is not None:
+                result = results[row['pair']]
+                nominal = row['nominal']
+                length = int(result['valid'].sum())
+                metrics = dict(reward=float(result['reward'].sum(dtype=np.float64)),
+                               cost=float(result['cost'].sum(dtype=np.float64)), steps=length,
+                               added_hazard_cost=float(result['added_hazard_cost'].sum(dtype=np.float64)))
+                metrics['end_reason'] = 'time_limit' if result['truncation'][length-1] else 'environment_done'
+                metrics['cost_without_added_hazards'] = metrics['cost'] - metrics['added_hazard_cost']
+                nominal['cost_without_added_hazards'] = nominal['cost']
+                winner = ('nominal' if nominal['reward'] > metrics['reward'] and nominal['cost'] < metrics['cost']
+                          else 'real' if metrics['reward'] > nominal['reward'] and metrics['cost'] < nominal['cost']
+                          else 'none')
+                filename = f"real_rollouts/pair_{row['pair']:06d}.npz"
+                np.savez_compressed(args.output / filename, **{k: v[:length] for k, v in result.items()})
+                row.update(status='compared', real=metrics, winner=winner,
+                           nominal_added_hazard_penetration=0., real_rollout=filename)
+            rows.append(row)
+            log.write(json.dumps(row) + '\n')
+            log.flush()
+            print(f"Pair {row['pair']+1}/{total}: " + json.dumps(row), flush=True)
+        pending.clear()
     with (args.output / 'hazard_comparisons.jsonl').open('w') as log:
         for pair, (lane, episode_id, episode) in enumerate(iter_episodes(args.output, manifest)):
             reward = episode['reward']
@@ -145,6 +182,7 @@ def compare_episodes(args, manifest, network, params):
             states = [SimpleNamespace(pipeline_state=SimpleNamespace(q=q, qd=qd,
                       x=SimpleNamespace(pos=xyz)), info={'hazard_positions': hazard_positions})
                       for q, qd, xyz in zip(physical['q'], physical['qd'], physical['xyz'])]
+            inputs = None
             try:
                 positions, widths = choose_hazard(base, states,
                     np.random.default_rng(np.random.SeedSequence([args.hazard_seed, lane, episode_id])),
@@ -161,7 +199,7 @@ def compare_episodes(args, manifest, network, params):
                 # Verify all recorded nominal states against the actual rectangular cost region.
                 feet = physical['xyz'][:, base._foot_link_ids]
                 delta = np.abs(feet[:, :, None, :2] - positions[None, None, :, :2])
-                normalized = delta / np.stack([widths, np.full_like(widths, args.platform_half_width)], axis=1)
+                normalized = delta[:, :, :placed_count] / np.stack([widths[:placed_count], np.full_like(widths[:placed_count], args.platform_half_width)], axis=1)
                 penetration = np.maximum(0., 1. - normalized.max(axis=-1))
                 grounded = feet[..., 2] < real._hazard_height * 2 + .08
                 if np.any(penetration * grounded[..., None] > 0):
@@ -178,34 +216,21 @@ def compare_episodes(args, manifest, network, params):
                 extension_key = jax.random.fold_in(jax.random.fold_in(jax.random.PRNGKey(args.seed), lane), episode_id)
                 extension = jax.random.normal(extension_key, noise.shape)
                 noise = jnp.where(jnp.arange(horizon)[:, None] < len(reward), noise, extension)
-                result = jax.device_get(run(jnp.asarray(initials['q'][lane]),
-                    jnp.asarray(initials['qd'][lane]), jnp.asarray(np.concatenate([hazard_positions, positions])),
-                    jnp.asarray(widths, dtype=jnp.float32), noise))
-                length = int(result['valid'].sum())
-                metrics = dict(reward=float(result['reward'].sum(dtype=np.float64)),
-                               cost=float(result['cost'].sum(dtype=np.float64)), steps=length,
-                               added_hazard_cost=float(result['added_hazard_cost'].sum(dtype=np.float64)))
-                metrics['end_reason'] = 'time_limit' if result['truncation'][length-1] else 'environment_done'
-                metrics['cost_without_added_hazards'] = metrics['cost'] - metrics['added_hazard_cost']
-                nominal['cost_without_added_hazards'] = nominal['cost']
-                winner = ('nominal' if nominal['reward'] > metrics['reward'] and nominal['cost'] < metrics['cost']
-                          else 'real' if metrics['reward'] > nominal['reward'] and metrics['cost'] < nominal['cost']
-                          else 'none')
-                filename = f'real_rollouts/pair_{pair:06d}.npz'
-                np.savez_compressed(args.output / filename, **{k: v[:length] for k, v in result.items()})
-                row.update(status='compared', real=metrics, winner=winner,
-                           positions=positions[:placed_count].tolist(), half_lengths=widths[:placed_count].tolist(),
-                           num_added_hazards=placed_count,
-                           nominal_added_hazard_penetration=0., real_rollout=filename)
-            rows.append(row)
-            log.write(json.dumps(row) + '\n')
-            log.flush()
-            print(f"Pair {pair+1}/{total}: " + json.dumps(row), flush=True)
+                row.update(positions=positions[:placed_count].tolist(),
+                           half_lengths=widths[:placed_count].tolist(), num_added_hazards=placed_count)
+                inputs = (jnp.asarray(initials['q'][lane]), jnp.asarray(initials['qd'][lane]),
+                          jnp.asarray(np.concatenate([hazard_positions, positions])),
+                          jnp.asarray(widths, dtype=jnp.float32), noise)
+            pending.append((row, inputs))
+            if len(pending) == batch_size:
+                flush(log)
+        if pending:
+            flush(log)
     if len(rows) != total:
         raise RuntimeError(f'Expected {total} completed episodes, read {len(rows)}')
     compared = [row for row in rows if row['status'] == 'compared']
     summary = dict(total_episodes=len(rows), compared=len(compared), skipped=len(rows)-len(compared),
-                   seconds=time.perf_counter()-started,
+                   seconds=time.perf_counter()-started, comparison_batch_size=batch_size,
                    winners={label: sum(r['winner'] == label for r in compared) for label in ('nominal', 'real', 'none')},
                    means={label: {metric: float(np.mean([r[label][metric] for r in compared]))
                           for metric in ('reward', 'cost', 'steps', 'added_hazard_cost', 'cost_without_added_hazards')}

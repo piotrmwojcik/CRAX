@@ -181,10 +181,13 @@ def main():
     parser.add_argument('--num-added-hazards', type=int, default=1,
                         help='Simultaneous hazards per episode; 0 disables comparison')
     parser.add_argument('--hazard-seed', type=int, default=42)
+    parser.add_argument('--comparison-batch-size', type=int, default=16,
+                        help='Real-hazard branches processed together; lower if GPU memory is limited')
     parser.add_argument('--platform-half-width', type=float, default=1.0)
     args = parser.parse_args()
     if min(args.num_envs, args.episode_length, args.action_repeat,
-           args.unroll_length, args.batch_size, args.num_minibatches, args.num_batches) < 1:
+           args.unroll_length, args.batch_size, args.num_minibatches, args.num_batches,
+           args.comparison_batch_size) < 1:
         parser.error('All counts must be positive')
     if args.batch_size * args.num_minibatches % args.num_envs:
         parser.error('--batch-size * --num-minibatches must be divisible by --num-envs')
