@@ -39,6 +39,8 @@ srun python -u -m training.train_env \
   --env_name safe_pathway_walker2d \
   --difficulty 3 \
   --safety_bound 25.0 \
+  --observed_episode_length_bound true \
+  --episode_length_ema 0.9 \
   --lagrangian_coef_rate 3.0 \
   --learning_rate 5e-4 \
   --num_timesteps 500000000 \

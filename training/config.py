@@ -211,13 +211,13 @@ def add_shared_training_args(parser: argparse.ArgumentParser) -> argparse.Argume
         nargs="?",
         const=True,
         default=False,
-        help="SAC-Lag: derive the per-step cost limit from observed episode lengths",
+        help="PPO-Lag/SAC-Lag: derive the per-step cost limit from observed episode lengths",
     )
     parser.add_argument(
         "--episode_length_ema",
         type=float,
         default=0.9,
-        help="SAC-Lag: EMA coefficient for observed episode length",
+        help="PPO-Lag/SAC-Lag: EMA coefficient for observed episode length",
     )
 
     # --- WandB ---
