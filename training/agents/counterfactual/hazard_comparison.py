@@ -28,6 +28,14 @@ class PhysicsRecorder(Wrapper):
         return self.record(self.env.step(state, action))
 
 
+def pareto_winner(nominal, real):
+    """Maximize episodic reward and minimize total episodic cost."""
+    def dominates(a, b):
+        return (a['reward'] >= b['reward'] and a['cost'] <= b['cost']
+                and (a['reward'] > b['reward'] or a['cost'] < b['cost']))
+    return 'nominal' if dominates(nominal, real) else 'real' if dominates(real, nominal) else 'none'
+
+
 def iter_episodes(output, manifest):
     """Read valid fragments in lane order and join across files until done."""
     num_envs = manifest['configuration']['num_envs']
@@ -154,9 +162,7 @@ def compare_episodes(args, manifest, network, params):
                 metrics['end_reason'] = 'time_limit' if result['truncation'][length-1] else 'environment_done'
                 metrics['cost_without_added_hazards'] = metrics['cost'] - metrics['added_hazard_cost']
                 nominal['cost_without_added_hazards'] = nominal['cost']
-                winner = ('nominal' if nominal['reward'] > metrics['reward'] and nominal['cost'] < metrics['cost']
-                          else 'real' if metrics['reward'] > nominal['reward'] and metrics['cost'] < nominal['cost']
-                          else 'none')
+                winner = pareto_winner(nominal, metrics)
                 filename = f"real_rollouts/pair_{row['pair']:06d}.npz"
                 np.savez_compressed(args.output / filename, **{k: v[:length] for k, v in result.items()})
                 row.update(status='compared', real=metrics, winner=winner,
@@ -236,6 +242,7 @@ def compare_episodes(args, manifest, network, params):
                           for metric in ('reward', 'cost', 'steps', 'added_hazard_cost', 'cost_without_added_hazards')}
                           for label in ('nominal', 'real')} if compared else {},
                    details='hazard_comparisons.jsonl',
+                   pareto_rule='reward >= and cost <=, with at least one strict inequality',
                    randomness='shared Gaussian innovations until nominal termination; seeded extension thereafter')
     (args.output / 'hazard_summary.json').write_text(json.dumps(summary, indent=2))
     print('PHASE 2 COMPLETE: ' + json.dumps(summary), flush=True)

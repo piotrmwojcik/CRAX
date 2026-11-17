@@ -4,6 +4,7 @@ Uses the same wrappers, stochastic policy, generate_unroll, scan, and fragment
 layout as PPO training, then compare completed episodes with added hazards.
 """
 import argparse
+import copy
 import json
 from pathlib import Path
 import time
@@ -181,6 +182,11 @@ def main():
     parser.add_argument('--num-added-hazards', type=int, default=1,
                         help='Simultaneous hazards per episode; 0 disables comparison')
     parser.add_argument('--hazard-seed', type=int, default=42)
+    parser.add_argument('--max-added-hazards', type=int, default=None,
+                        help='Enable staged collection up to this hazard cap (inclusive)')
+    parser.add_argument('--generations-per-stage', type=int, default=1,
+                        help='Complete collection/comparison rounds before increasing hazards')
+    parser.add_argument('--hazard-increment', type=int, default=1)
     parser.add_argument('--comparison-batch-size', type=int, default=16,
                         help='Real-hazard branches processed together; lower if GPU memory is limited')
     parser.add_argument('--platform-half-width', type=float, default=1.0)
@@ -199,6 +205,71 @@ def main():
         parser.error('Hazard count must be nonnegative and platform half-width positive')
     if args.num_added_hazards and (args.env != 'safe_pathway_walker2d' or args.action_repeat != 1):
         parser.error('Hazard comparison currently requires safe_pathway_walker2d and action-repeat=1')
+    if args.generations_per_stage < 1 or args.hazard_increment < 1:
+        parser.error('Stage generations and hazard increment must be positive')
+    if args.max_added_hazards is not None:
+        if args.num_added_hazards < 1 or args.max_added_hazards < args.num_added_hazards:
+            parser.error('Staged collection requires 1 <= num-added-hazards <= max-added-hazards')
+        collect_stages(args)
+    else:
+        collect_dataset(args)
+
+
+def collect_stages(args, collector=None):
+    """Finish and assess each stage before increasing the added-hazard cap."""
+    collector = collector or collect_dataset
+    args.output.mkdir(parents=True)
+    report = dict(status='collecting', stages=[],
+                  progression='fixed number of generations per stage',
+                  pareto_rule='reward >= and cost <=, with at least one strict inequality',
+                  fraction_denominator='compared pairs only; skipped pairs excluded')
+
+    def save():
+        temp = args.output / 'staged_collection.json.tmp'
+        temp.write_text(json.dumps(report, indent=2))
+        temp.replace(args.output / 'staged_collection.json')
+
+    save()
+    cap = args.num_added_hazards
+    generation = 0
+    while True:
+        stage = dict(hazard_cap=cap, generations=[], status='collecting',
+                     total_episodes=0, compared=0, skipped=0,
+                     winners={name: 0 for name in ('nominal', 'real', 'none')})
+        report['stages'].append(stage)
+        save()
+        for index in range(args.generations_per_stage):
+            current = copy.copy(args)
+            current.num_added_hazards = cap
+            current.max_added_hazards = None
+            current.seed = args.seed + generation
+            current.hazard_seed = args.hazard_seed + generation
+            current.output = args.output / f'hazards_{cap:03d}' / f'generation_{index:03d}'
+            manifest = collector(current)
+            summary = manifest['hazard_comparison']
+            stage['generations'].append(dict(dataset=str(current.output.relative_to(args.output)),
+                                             seed=current.seed, hazard_seed=current.hazard_seed,
+                                             summary=summary))
+            for key in ('total_episodes', 'compared', 'skipped'):
+                stage[key] += summary[key]
+            for name in stage['winners']:
+                stage['winners'][name] += summary['winners'][name]
+            generation += 1
+            save()
+        stage['fractions'] = {name: count / stage['compared'] if stage['compared'] else None
+                              for name, count in stage['winners'].items()}
+        stage['status'] = 'complete'
+        save()
+        print('HAZARD STAGE COMPLETE: ' + json.dumps(stage), flush=True)
+        if cap == args.max_added_hazards:
+            break
+        cap = min(cap + args.hazard_increment, args.max_added_hazards)
+    report['status'] = 'complete'
+    save()
+    return report
+
+
+def collect_dataset(args):
 
     path = resolve_checkpoint(args.checkpoint)
     network, params, make_policy, algorithm = load_collection_policy(path)
@@ -308,6 +379,7 @@ def main():
     manifest['status'] = 'complete'
     save_manifest()
     print(f'Saved dataset: {args.output.resolve()}', flush=True)
+    return manifest
 
 
 if __name__ == '__main__':

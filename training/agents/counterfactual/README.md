@@ -329,3 +329,42 @@ assembly and CPU hazard-placement pass. Missing, incomplete, malformed, or
 incompatible caches fall back to placement computation. The edited manifest
 records `lidar_edit.placement_source`. Existing complete datasets can benefit
 without rerunning collection. Already-running jobs do not pick up these changes.
+
+### Increasing the added-hazard count between generations
+
+Enable staged collection with `--max-added-hazards`. For example:
+
+```bash
+python -m training.agents.counterfactual.collect_rollouts \
+  --checkpoint models/YOUR_CHECKPOINT \
+  --output results/staged_collection \
+  --env safe_pathway_walker2d --level 3 \
+  --num-added-hazards 1 --max-added-hazards 3 \
+  --hazard-increment 1 --generations-per-stage 2 --num-batches 1
+```
+
+This performs two complete collection/comparison generations at each added-hazard
+cap: 1, 2, then 3. A generation collects `--num-batches` PPO batches and finishes
+all pending episodes, so its number of complete trajectories is not fixed.
+Collection and hazard seeds increase by one per generation. The checkpoint stays
+frozen; the nominal environment's original hazard count stays unchanged. Only
+the extra hazards in the paired real branches increase. Placement may produce
+fewer hazards than the cap when there is insufficient safe space.
+
+Each generation is a standalone dataset under
+`hazards_001/generation_000/`, with its usual manifest, nominal batches, paired
+real rollouts, and comparison JSONL. Pass an individual generation directory to
+existing lidar editing, analysis, and fine-tuning commands. The parent directory
+is an index, not a combined dataset.
+
+`staged_collection.json` records progress and stage totals: compared/skipped
+pairs, nominal/real/neither winners, and fractions among compared pairs. A pair
+dominates when its total reward is no smaller and total cost is no greater,
+with at least one strict improvement. This also updates ordinary collection's
+winner rule to count improvements with equal reward or equal cost. Exact ties
+and reward/cost tradeoffs have winner `none`; all-skipped stages have null
+fractions. Results are reported before raising the cap; progression is fixed,
+not gated on a dominance threshold. The final cap is always evaluated, even
+when the increment does not divide the range. Omit `--max-added-hazards` for
+ordinary single-generation collection. Use a fresh output directory; interrupted
+staged runs retain completed generation datasets but do not automatically resume.
