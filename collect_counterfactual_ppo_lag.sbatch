@@ -49,12 +49,12 @@ srun python -u -m training.agents.counterfactual.collect_rollouts \
   --env safe_pathway_walker2d \
   --level "${LEVEL:-3}" \
   --seed "${SEED:-4}" \
-  --num-envs 2048 \
+  --num-envs "${NUM_ENVS:-2048}" \
   --episode-length 2000 \
   --action-repeat 1 \
-  --unroll-length 8 \
-  --batch-size 1024 \
-  --num-minibatches 32 \
+  --unroll-length "${UNROLL_LENGTH:-8}" \
+  --batch-size "${BATCH_SIZE:-1024}" \
+  --num-minibatches "${NUM_MINIBATCHES:-32}" \
   --num-batches "${NUM_BATCHES:-1}" \
   --num-added-hazards "$starting_hazards" \
   "${stage_args[@]}" \
