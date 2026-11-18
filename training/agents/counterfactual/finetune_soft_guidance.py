@@ -260,8 +260,6 @@ def main():
         run_log.define_metric('iteration')
         run_log.define_metric('num_steps')
         run_log.define_metric('train/*', step_metric='num_steps')
-        for policy, scope in evaluators:
-            run_log.define_metric(f'{policy}/{scope}/*', step_metric='num_steps')
         run_log.define_metric('video/*', step_metric='num_steps')
         evaluation_history = []
 
@@ -276,28 +274,22 @@ def main():
                 for key, value in metrics.items():
                     record[f'{policy}/{scope}/{key.removeprefix("eval/")}'] = float(value)
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
-            run_log.log(record, step=environment_steps, commit=False)
             if args.wandb_mode != 'disabled':
-                import matplotlib.pyplot as plt
-
                 evaluation_history.append(record)
                 steps = [row['num_steps'] for row in evaluation_history]
-                charts = {}
+                charts = dict(iteration=iteration, num_steps=environment_steps)
                 for key in record:
                     if not key.startswith('baseline/'):
                         continue
                     _, scope, metric = key.split('/', 2)
-                    fig, ax = plt.subplots(figsize=(6, 3.5), layout='constrained')
-                    for policy, label, color, style in (
-                        ('baseline', 'Baseline', '#0072B2', '-'),
-                        ('finetuned', 'Fine-tuned', '#D55E00', '--'),
-                    ):
-                        values = [row[f'{policy}/{scope}/{metric}'] for row in evaluation_history]
-                        ax.plot(steps, values, style, color=color, marker='.', label=label)
-                    ax.set(xlabel='Training environment steps', ylabel=metric)
-                    ax.legend()
-                    charts[f'{scope}_comparison/{metric}'] = wandb.Image(fig)
-                    plt.close(fig)
+                    charts[f'{scope}/{metric}'] = wandb.plot.line_series(
+                        xs=steps,
+                        ys=[[row[f'{policy}/{scope}/{metric}'] for row in evaluation_history]
+                            for policy in ('baseline', 'finetuned')],
+                        keys=['Baseline', 'Current'],
+                        title=metric,
+                        xname='Training environment steps',
+                    )
                 run_log.log(charts, step=environment_steps, commit=False)
             print(json.dumps(record), flush=True)
 
