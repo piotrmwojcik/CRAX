@@ -1,4 +1,4 @@
-"""Online imitation by gradient descent on squared MMD to one expert dataset."""
+"""Fine-tune a policy with online MMD imitation or offline behavioral cloning."""
 import argparse
 import functools
 import json
@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 import numpy as np
+import optax
 
 from crax import envs
 from crax.envs.wrappers import training as wrappers
@@ -124,18 +125,97 @@ def make_update(network, normalizer, unravel):
     return jax.jit(measures), reward_grad, discrepancy_grad, hessian_product
 
 
+def make_mmd_step(args, env, network, normalizer, unravel, horizon, expert, rng):
+    feature_mean = expert.mean(axis=0)
+    feature_scale = np.maximum(expert.std(axis=0), .1)
+    expert = (expert-feature_mean)/feature_scale
+    probe = expert[rng.choice(len(expert), min(512, len(expert)), replace=False)]
+    distances = np.sqrt(np.maximum(((probe[:, None]-probe[None, :])**2).sum(-1), 0.))
+    nonzero = distances[distances > 0]
+    bandwidth = args.bandwidth or (float(np.median(nonzero)) if len(nonzero) else 1.)
+    rollout = make_rollout(env, network, normalizer, horizon)
+    mmd_measure, mmd_gradient = make_mmd_update(network, normalizer, unravel)
+    key = jax.random.PRNGKey(args.seed)
+
+    def step(theta):
+        nonlocal key
+        key, action_key, reset_key = jax.random.split(key, 3)
+        data = rollout(unravel(theta), action_key, jax.random.split(reset_key, args.num_envs))
+        valid = np.asarray(data['valid'])
+        occupancy = valid * args.gamma**np.arange(horizon)[:, None]
+        probability = occupancy.reshape(-1)/occupancy.sum()
+        indices = rng.choice(len(probability), args.mmd_samples, p=probability)
+        online = np.concatenate([np.asarray(data['obs']),np.asarray(data['action'])],axis=-1).reshape(-1, expert.shape[1])
+        online = (online[indices]-feature_mean)/feature_scale
+        demos = expert[rng.integers(len(expert),size=args.mmd_samples)]
+        kernels = tuple(gaussian_kernel(jnp.asarray(x),jnp.asarray(y),bandwidth)
+                        for x,y in ((online,online),(online,demos),(demos,demos)))
+        indices = jnp.asarray(indices)
+        old = theta
+        discrepancy = float(mmd_measure(old, data, indices, kernels))
+        gradient = mmd_gradient(old, data, indices, kernels)
+        if not np.isfinite(np.asarray(gradient)).all():
+            raise FloatingPointError('Nonfinite MMD gradient')
+        theta = old - args.learning_rate * gradient
+        if not np.isfinite(np.asarray(theta)).all():
+            raise FloatingPointError('Nonfinite actor parameters')
+        after = float(mmd_measure(theta, data, indices, kernels))
+        return theta, dict(
+            mmd_before=discrepancy, mmd_after=after,
+            gradient_norm=float(jnp.linalg.norm(gradient)),
+            update_norm=float(jnp.linalg.norm(theta-old)),
+            rollout_reward=float(data['reward'].sum()/args.num_envs),
+            rollout_cost=float(data['cost'].sum()/args.num_envs),
+            rollout_steps=float(data['valid'].sum()/args.num_envs))
+
+    return step, dict(mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)
+
+
+def make_cloning_step(network, normalizer, unravel, theta, expert, observation_size,
+                      batch_size, learning_rate, rng):
+    distribution = network.parametric_action_distribution
+    optimizer = optax.adam(learning_rate)
+    optimizer_state = optimizer.init(theta)
+
+    def loss(weights, batch):
+        logits = network.policy_network.apply(normalizer, unravel(weights), batch[:, :observation_size])
+        # Saturated float32 tanh actions need a finite inverse at the bounds.
+        actions = jnp.clip(batch[:, observation_size:], -1 + 1e-6, 1 - 1e-6)
+        raw = distribution.inverse_postprocess(actions)
+        return -jnp.mean(distribution.log_prob(logits, raw))
+
+    @jax.jit
+    def update(weights, state, batch):
+        nll, gradient = jax.value_and_grad(loss)(weights, batch)
+        updates, state = optimizer.update(gradient, state, weights)
+        return optax.apply_updates(weights, updates), state, nll, optax.global_norm(gradient)
+
+    def step(weights):
+        nonlocal optimizer_state
+        batch = expert[rng.integers(len(expert), size=batch_size)]
+        updated, optimizer_state, nll, grad_norm = update(weights, optimizer_state, batch)
+        if not np.isfinite([float(nll), float(grad_norm)]).all() or not np.isfinite(np.asarray(updated)).all():
+            raise FloatingPointError('Nonfinite behavioral cloning update')
+        return updated, dict(action_nll=float(nll), gradient_norm=float(grad_norm),
+                             update_norm=float(jnp.linalg.norm(updated - weights)))
+
+    return step
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset', required=True, type=Path, help='Completed lidar-edited nominal dataset')
     p.add_argument('--checkpoint', type=Path, help='Defaults to source checkpoint in manifest')
     p.add_argument('--output', required=True, type=Path)
+    p.add_argument('--method', choices=('mmd', 'cloning'), default='mmd')
+    p.add_argument('--batch-size', type=int, default=512, help='Behavioral cloning minibatch size')
     p.add_argument('--iterations', type=int, default=100)
     p.add_argument('--num-envs', type=int, default=16)
     p.add_argument('--episode-length', type=int, help='Defaults to dataset episode length')
     p.add_argument('--expert-capacity', type=int, default=100000)
     p.add_argument('--mmd-samples', type=int, default=512)
     p.add_argument('--gamma', type=float, default=.99)
-    p.add_argument('--learning-rate', type=float, default=5e-4, help='MMD gradient descent step size')
+    p.add_argument('--learning-rate', type=float, default=5e-4, help='Actor learning rate')
     p.add_argument('--bandwidth', type=float, help='Gaussian kernel width; defaults to median distance')
     p.add_argument('--save-every', type=int, default=10)
     p.add_argument('--seed', type=int, help='Defaults to the training seed in the checkpoint run name')
@@ -152,7 +232,7 @@ def main():
     p.add_argument('--wandb-entity', default=None)
     p.add_argument('--wandb-name', default=None)
     args = p.parse_args()
-    positive = (args.iterations, args.num_envs, args.expert_capacity, args.mmd_samples,
+    positive = (args.batch_size, args.iterations, args.num_envs, args.expert_capacity, args.mmd_samples,
                 args.save_every, args.learning_rate, args.num_eval_envs)
     if min(positive) <= 0 or not 0 < args.gamma <= 1:
         p.error('Counts and tolerances must be positive; 0 < gamma <= 1')
@@ -185,21 +265,31 @@ def main():
     normalizer, actor = params[0], params[1]
     theta, unravel = ravel_pytree(actor)
     rng = np.random.default_rng(args.seed)
-    expert, counts = load_demonstrations(args.dataset, manifest, args.expert_capacity, args.gamma, rng)
-    feature_mean = expert.mean(axis=0)
-    feature_scale = np.maximum(expert.std(axis=0), .1)
-    expert = (expert-feature_mean)/feature_scale
-    probe = expert[rng.choice(len(expert), min(512, len(expert)), replace=False)]
-    distances = np.sqrt(np.maximum(((probe[:, None]-probe[None, :])**2).sum(-1), 0.))
-    nonzero = distances[distances > 0]
-    bandwidth = args.bandwidth or (float(np.median(nonzero)) if len(nonzero) else 1.)
+    cloning = args.method == 'cloning'
+    sampling_discount = 1.0 if cloning else args.gamma
+    expert, counts = load_demonstrations(args.dataset, manifest, args.expert_capacity, sampling_discount, rng)
     from training.agents.counterfactual.demonstration_env import make_demonstration_env
     board_env, board_ids = make_demonstration_env(args.dataset, manifest)
-    env = wrappers.wrap(board_env, episode_length=horizon, action_repeat=1)
-    if expert.shape[1] != env.observation_size + env.action_size:
+    if expert.shape[1] != board_env.observation_size + board_env.action_size:
         raise ValueError('Demonstration dimensions do not match environment')
-    rollout = make_rollout(env, network, normalizer, horizon)
-    mmd_measure, mmd_gradient = make_mmd_update(network, normalizer, unravel)
+    if cloning:
+        train_step = make_cloning_step(network, normalizer, unravel, theta, expert, board_env.observation_size,
+                                       args.batch_size, args.learning_rate, rng)
+        mode = 'behavioral_cloning'
+        step_label = 'Demonstration transitions sampled'
+        steps_per_iteration = args.batch_size
+        method_report = dict(method=mode, objective='Supervised negative log likelihood of expert actions',
+                             estimator='Uniform demonstration transitions, Adam minibatch updates')
+    else:
+        env = wrappers.wrap(board_env, episode_length=horizon, action_repeat=1)
+        train_step, features = make_mmd_step(args, env, network, normalizer, unravel, horizon, expert, rng)
+        mode = 'mmd_gradient_descent'
+        step_label = 'Training environment steps'
+        steps_per_iteration = horizon * args.num_envs
+        method_report = dict(method='MMD imitation: theta <- theta - learning_rate * grad(MMD squared)',
+                             objective='MMD squared only; reward and safety cost are evaluation metrics',
+                             estimator='normalized discounted occupancy; prefix importance weights; empirical squared MMD',
+                             paper='https://arxiv.org/abs/1911.07109', bandwidth=features['bandwidth'])
     eval_iterations = set()
     evaluators = {}
     if args.num_evals > 0:
@@ -228,17 +318,14 @@ def main():
     checkpoint_config = checkpoint_io.load_config(path/config_name)
     args.output.mkdir(parents=True)
     report = dict(configuration={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
-                  source_checkpoint=str(path), demonstrations=counts, bandwidth=bandwidth,
-                  method='MMD imitation: theta <- theta - learning_rate * grad(MMD squared)',
+                  source_checkpoint=str(path), demonstrations=counts, **method_report,
+                  num_steps_unit=step_label,
                   online_environment=dict(env=config['env'], level=config['level'], episode_length=horizon,
                       reset='Uniform sampling of saved demonstration episode boards and initial states',
                       added_hazards='Real, lidar-visible and cost-active, with recorded widths',
                       board_ids=board_ids),
-                  objective='MMD squared only; reward and safety cost are evaluation metrics',
                   expert_policy=str(manifest['checkpoint']),
-                  normalizer='frozen', expert_filter='all nominal episodes; no winner filtering',
-                  estimator='normalized discounted occupancy; prefix importance weights; empirical squared MMD',
-                  paper='https://arxiv.org/abs/1911.07109')
+                  normalizer='frozen', expert_filter='all nominal episodes; no winner filtering')
     report['evaluation'] = dict(env=config['env'], level=3, iterations=sorted(eval_iterations),
                                 episodes_per_policy=args.num_eval_envs, seed=args.seed,
                                 expert_eval='Uniform resets on the training demonstration boards with real added hazards',
@@ -248,9 +335,9 @@ def main():
                           'versus recorded nominal expert; fixed example from the training board bank',
                           colors=dict(original='red', current_added='yellow', nominal_added='blue'))
     (args.output/'run.json').write_text(json.dumps(report, indent=2))
-    np.savez(args.output/'mmd_features.npz', mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)
-    environment_steps = 0
-    key = jax.random.PRNGKey(args.seed)
+    if not cloning:
+        np.savez(args.output/'mmd_features.npz', **features)
+    training_steps = 0
     import wandb
     with wandb.init(project=args.wandb_project, entity=args.wandb_entity,
                     name=args.wandb_name or args.output.name, mode=args.wandb_mode,
@@ -264,7 +351,7 @@ def main():
         evaluation_history = []
 
         def evaluate(iteration):
-            record = dict(iteration=iteration, num_steps=environment_steps)
+            record = dict(iteration=iteration, num_steps=training_steps)
             current_params = (params[0], unravel(theta), *params[2:])
             policy_params = {'baseline': params, 'finetuned': current_params}
             for (policy, scope), evaluator in evaluators.items():
@@ -277,7 +364,7 @@ def main():
             if args.wandb_mode != 'disabled':
                 evaluation_history.append(record)
                 steps = [row['num_steps'] for row in evaluation_history]
-                charts = dict(iteration=iteration, num_steps=environment_steps)
+                charts = dict(iteration=iteration, num_steps=training_steps)
                 for key in record:
                     if not key.startswith('baseline/'):
                         continue
@@ -288,20 +375,20 @@ def main():
                             for policy in ('baseline', 'finetuned')],
                         keys=['Baseline', 'Current'],
                         title=metric,
-                        xname='Training environment steps',
+                        xname=step_label,
                     )
-                run_log.log(charts, step=environment_steps, commit=False)
+                run_log.log(charts, step=training_steps, commit=False)
             print(json.dumps(record), flush=True)
 
         def publish_video(iteration):
             if video is None:
                 return
             filename, fps = video.write(unravel(theta), args.output/'videos'/f'{iteration:06d}', iteration)
-            run_log.log({'iteration': iteration, 'num_steps': environment_steps,
+            run_log.log({'iteration': iteration, 'num_steps': training_steps,
                          'video/current_vs_nominal': wandb.Video(str(filename), fps=fps, format='mp4',
                              caption='Current policy: yellow added hazards; recorded nominal expert: blue; '
                                      'original hazards: red. Separate diagnostic rollout.')},
-                        step=environment_steps, commit=False)
+                        step=training_steps, commit=False)
 
         if 0 in eval_iterations:
             evaluate(0)
@@ -309,44 +396,15 @@ def main():
         run_log.log({}, step=0, commit=True)
         for iteration in range(1, args.iterations+1):
             started = time.perf_counter()
-            key, action_key, reset_key = jax.random.split(key, 3)
-            data = rollout(unravel(theta), action_key, jax.random.split(reset_key, args.num_envs))
-            valid = np.asarray(data['valid'])
-            occupancy = valid * args.gamma**np.arange(horizon)[:, None]
-            probability = occupancy.reshape(-1)/occupancy.sum()
-            indices = rng.choice(len(probability), args.mmd_samples, p=probability)
-            online = np.concatenate([np.asarray(data['obs']),np.asarray(data['action'])],axis=-1).reshape(-1, expert.shape[1])
-            online = (online[indices]-feature_mean)/feature_scale
-            demos = expert[rng.integers(len(expert),size=args.mmd_samples)]
-            kernels = tuple(gaussian_kernel(jnp.asarray(x),jnp.asarray(y),bandwidth)
-                            for x,y in ((online,online),(online,demos),(demos,demos)))
-            indices = jnp.asarray(indices)
-            old = theta
-            discrepancy = float(mmd_measure(old, data, indices, kernels))
-            gradient = mmd_gradient(old, data, indices, kernels)
-            if not np.isfinite(np.asarray(gradient)).all():
-                raise FloatingPointError('Nonfinite MMD gradient')
-            theta = old - args.learning_rate * gradient
-            if not np.isfinite(np.asarray(theta)).all():
-                raise FloatingPointError('Nonfinite actor parameters')
-            after = float(mmd_measure(theta, data, indices, kernels))
-            # The full scan executes horizon steps in every lane, including
-            # masked post-termination steps, as PPO evaluation does.
-            environment_steps += horizon * args.num_envs
-            row = dict(iteration=iteration, num_steps=environment_steps,
-                       mode='mmd_gradient_descent', learning_rate=args.learning_rate,
-                       mmd_before=discrepancy, mmd_after=after,
-                       gradient_norm=float(jnp.linalg.norm(gradient)),
-                       update_norm=float(jnp.linalg.norm(theta-old)),
-                       rollout_reward=float(data['reward'].sum()/args.num_envs),
-                       rollout_cost=float(data['cost'].sum()/args.num_envs),
-                       rollout_steps=float(data['valid'].sum()/args.num_envs),
-                       seconds=time.perf_counter()-started)
+            theta, metrics = train_step(theta)
+            training_steps += steps_per_iteration
+            row = dict(iteration=iteration, num_steps=training_steps, mode=mode,
+                       learning_rate=args.learning_rate, **metrics, seconds=time.perf_counter()-started)
             log.write(json.dumps(row)+'\n'); log.flush()
             print(json.dumps(row),flush=True)
-            run_log.log({'iteration': iteration, 'num_steps': environment_steps,
+            run_log.log({'iteration': iteration, 'num_steps': training_steps,
                          **{f'train/{k}': v for k, v in row.items() if k not in ('iteration', 'num_steps')}},
-                        step=environment_steps, commit=False)
+                        step=training_steps, commit=False)
             if iteration % args.save_every == 0 or iteration == args.iterations:
                 updated = list(params); updated[1] = unravel(theta)
                 checkpoint_io.save(args.output/'checkpoint', iteration, tuple(updated), checkpoint_config, config_name)
@@ -355,7 +413,7 @@ def main():
                 evaluate(iteration)
             if video is not None and (iteration % args.video_every == 0 or iteration == args.iterations):
                 publish_video(iteration)
-            run_log.log({}, step=environment_steps, commit=True)
+            run_log.log({}, step=training_steps, commit=True)
     print(f'Saved fine-tuned checkpoint: {args.output}/checkpoint/{args.iterations:012d}',flush=True)
 
 
