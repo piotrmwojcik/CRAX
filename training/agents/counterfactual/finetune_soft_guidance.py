@@ -267,7 +267,9 @@ def main():
     rng = np.random.default_rng(args.seed)
     cloning = args.method == 'cloning'
     sampling_discount = 1.0 if cloning else args.gamma
+    print(f'Loading demonstrations from {args.dataset}', flush=True)
     expert, counts = load_demonstrations(args.dataset, manifest, args.expert_capacity, sampling_discount, rng)
+    print(f"Loaded {counts['episodes']} episodes. Preparing evaluation environments.", flush=True)
     from training.agents.counterfactual.demonstration_env import make_demonstration_env
     board_env, board_ids = make_demonstration_env(args.dataset, manifest)
     if expert.shape[1] != board_env.observation_size + board_env.action_size:
@@ -355,6 +357,8 @@ def main():
             current_params = (params[0], unravel(theta), *params[2:])
             policy_params = {'baseline': params, 'finetuned': current_params}
             for (policy, scope), evaluator in evaluators.items():
+                print(f'Iteration {iteration}: starting {policy}/{scope} '
+                      f'({args.num_eval_envs} episodes)', flush=True)
                 metrics = evaluator.run_evaluation(policy_params[policy], {})
                 metrics['eval/hazard_cost_per_step'] = (
                     metrics['eval/episode_hazard_cost'] / metrics['eval/avg_episode_length'])
@@ -383,6 +387,7 @@ def main():
         def publish_video(iteration):
             if video is None:
                 return
+            print(f'Iteration {iteration}: rendering diagnostic video', flush=True)
             filename, fps = video.write(unravel(theta), args.output/'videos'/f'{iteration:06d}', iteration)
             run_log.log({'iteration': iteration, 'num_steps': training_steps,
                          'video/current_vs_nominal': wandb.Video(str(filename), fps=fps, format='mp4',
@@ -394,6 +399,7 @@ def main():
             evaluate(0)
         publish_video(0)
         run_log.log({}, step=0, commit=True)
+        print(f'Starting {mode} training ({args.iterations} updates)', flush=True)
         for iteration in range(1, args.iterations+1):
             started = time.perf_counter()
             theta, metrics = train_step(theta)
