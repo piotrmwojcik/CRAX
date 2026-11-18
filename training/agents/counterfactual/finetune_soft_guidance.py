@@ -2,6 +2,7 @@
 import argparse
 import functools
 import json
+import re
 from pathlib import Path
 import time
 
@@ -137,7 +138,7 @@ def main():
     p.add_argument('--learning-rate', type=float, default=5e-4, help='MMD gradient descent step size')
     p.add_argument('--bandwidth', type=float, help='Gaussian kernel width; defaults to median distance')
     p.add_argument('--save-every', type=int, default=10)
-    p.add_argument('--seed', type=int, default=3)
+    p.add_argument('--seed', type=int, help='Defaults to the training seed in the checkpoint run name')
     p.add_argument('--num-evals', type=int, default=10)
     p.add_argument('--num-eval-envs', type=int, default=128)
     p.add_argument('--deterministic-eval', action='store_true')
@@ -171,6 +172,15 @@ def main():
     if args.output.exists():
         p.error('Use a new output directory')
     path = resolve_checkpoint(args.checkpoint or Path(manifest['checkpoint']))
+    if args.seed is None:
+        for directory in (path, *path.parents):
+            match = re.search(r'(?:^|_)seed([0-9]+)(?:_|$)', directory.name)
+            if match:
+                args.seed = int(match.group(1))
+                break
+        else:
+            p.error(f'Cannot infer training seed from checkpoint {path}. Set --seed explicitly.')
+    print(f'Fine-tuning and evaluation seed: {args.seed} (checkpoint: {path})', flush=True)
     network, params, make_policy, algorithm = load_collection_policy(path)
     normalizer, actor = params[0], params[1]
     theta, unravel = ravel_pytree(actor)

@@ -18,9 +18,12 @@ export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 : "${DATASET_DIR:?Set DATASET_DIR to the completed fake-lidar dataset}"
-checkpoint_args=()
+run_args=()
 if [[ -n "${PPO_CHECKPOINT:-}" ]]; then
-  checkpoint_args=(--checkpoint "$PPO_CHECKPOINT")
+  run_args=(--checkpoint "$PPO_CHECKPOINT")
+fi
+if [[ -n "${SEED:-}" ]]; then
+  run_args+=(--seed "$SEED")
 fi
 srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --dataset "$DATASET_DIR" \
@@ -28,7 +31,6 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --iterations "${ITERATIONS:-100}" \
   --num-envs "${NUM_ENVS:-16}" \
   --learning-rate "${LEARNING_RATE:-0.0005}" \
-  --seed "${SEED:-3}" \
   --num-evals "${NUM_EVALS:-10}" \
   --num-eval-envs "${NUM_EVAL_ENVS:-128}" \
   --video-every "${VIDEO_EVERY:-0}" \
@@ -38,4 +40,4 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --wandb-mode "${WANDB_MODE:-online}" \
   --wandb-project "${WANDB_PROJECT:-crax}" \
   --wandb-name "${WANDB_NAME:-mmd-imitation-${SLURM_JOB_ID}}" \
-  "${checkpoint_args[@]}"
+  "${run_args[@]}"
