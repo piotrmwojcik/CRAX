@@ -17,7 +17,7 @@ unset JAX_PLATFORMS
 export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-: "${DATASET_DIR:?Set DATASET_DIR to the completed fake-lidar dataset}"
+DATASET_DIR="${DATASET_DIR:-results/counterfactual_ppo_collection_29375024_fake_lidar_29375024/hazards_013/generation_000}"
 run_args=()
 if [[ -n "${PPO_CHECKPOINT:-}" ]]; then
   run_args=(--checkpoint "$PPO_CHECKPOINT")
