@@ -28,13 +28,10 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --iterations "${ITERATIONS:-100}" \
   --num-envs "${NUM_ENVS:-16}" \
   --learning-rate "${LEARNING_RATE:-0.0005}" \
-  --seed "${SEED:-0}" \
-  --eval-every "${EVAL_EVERY:-10}" \
-  --eval-episodes "${EVAL_EPISODES:-128}" \
-  --eval-seed "${EVAL_SEED:-10000}" \
-  --final-eval-episodes "${FINAL_EVAL_EPISODES:-512}" \
-  --final-eval-seed "${FINAL_EVAL_SEED:-60000}" \
-  --video-every "${VIDEO_EVERY:-10}" \
+  --seed "${SEED:-3}" \
+  --num-evals "${NUM_EVALS:-10}" \
+  --num-eval-envs "${NUM_EVAL_ENVS:-128}" \
+  --video-every "${VIDEO_EVERY:-0}" \
   --video-seed "${VIDEO_SEED:-20000}" \
   --video-stride "${VIDEO_STRIDE:-4}" \
   --video-camera "${VIDEO_CAMERA:-fixedfar}" \

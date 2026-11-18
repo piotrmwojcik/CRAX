@@ -1,5 +1,6 @@
 """Online imitation by gradient descent on squared MMD to one expert dataset."""
 import argparse
+import functools
 import json
 from pathlib import Path
 import time
@@ -11,6 +12,7 @@ import numpy as np
 
 from crax import envs
 from crax.envs.wrappers import training as wrappers
+from training.agents.ppo.train import _maybe_wrap_env
 from training import acting, checkpoint as checkpoint_io
 from training.agents.counterfactual.collect_rollouts import resolve_checkpoint, load_collection_policy
 from training.agents.counterfactual.hazard_comparison import iter_episodes
@@ -80,50 +82,12 @@ def make_mmd_update(network, normalizer, unravel):
     return jax.jit(discrepancy), jax.jit(jax.grad(discrepancy))
 
 
-def make_ppo_evaluation(env, network, normalizer, horizon):
-    """Use PPO's EvalWrapper and generate_unroll with its metric conventions.
-
-    Keep fixed reset/action keys for paired comparisons and retain individual
-    episode totals, unlike the aggregate-only default of acting.Evaluator.
-    """
-    eval_env = wrappers.EvalWrapper(env)
-    walltime = 0.
-
-    @jax.jit
-    def run(actor, reset_keys, key):
-        def policy(obs, action_key):
-            logits = network.policy_network.apply(normalizer, actor, obs)
-            dist = network.parametric_action_distribution
-            return dist.sample(logits, action_key), {}
-        state = eval_env.reset(reset_keys)
-        state, _ = acting.generate_unroll(eval_env, state, policy, key, horizon)
-        return state.info['eval_metrics']
-
-    def evaluate(actor, seed, episodes):
-        nonlocal walltime
-        started = time.perf_counter()
-        # Match the first evaluation key split in acting.Evaluator.
-        _, key = jax.random.split(jax.random.PRNGKey(seed))
-        result = jax.device_get(run(actor, jax.random.split(key, episodes), key))
-        seconds = time.perf_counter() - started
-        walltime += seconds
-        metrics = {}
-        for name, values in result.episode_metrics.items():
-            metrics[f'eval/episode_{name}'] = float(np.mean(values))
-            metrics[f'eval/episode_{name}_std'] = float(np.std(values))
-        metrics.update({
-            'eval/avg_episode_length': float(np.mean(result.episode_steps)),
-            'eval/std_episode_length': float(np.std(result.episode_steps)),
-            'eval/epoch_eval_time': seconds,
-            'eval/sps': horizon * episodes / seconds,
-            'eval/walltime': walltime,
-            'eval/episodes': episodes,
-            'eval/zero_cost_fraction': float(np.mean(result.episode_metrics['cost'] == 0)),
-        })
-        totals = np.column_stack([result.episode_metrics['reward'],
-                                  result.episode_metrics['cost'], result.episode_steps])
-        return metrics, totals
-    return evaluate
+def make_ppo_evaluator(env, make_policy, horizon, num_eval_envs, key, deterministic=False):
+    wrapped = _maybe_wrap_env(env, True, num_eval_envs, horizon, 1,
+                              device_count=1, key_env=key)
+    return acting.Evaluator(wrapped, functools.partial(make_policy, deterministic=deterministic),
+                            num_eval_envs=num_eval_envs, episode_length=horizon,
+                            action_repeat=1, key=key)
 
 
 def make_update(network, normalizer, unravel):
@@ -159,29 +123,6 @@ def make_update(network, normalizer, unravel):
     return jax.jit(measures), reward_grad, discrepancy_grad, hessian_product
 
 
-def evaluate_policy(rollout, actor, seed, episodes, return_episodes=False):
-    """Fixed independent random stream; does not consume training RNG."""
-    started = time.perf_counter()
-    key = jax.random.fold_in(jax.random.PRNGKey(seed), 1)
-    batches = []
-    batch_size = min(episodes, 32)
-    for start in range(0, episodes, batch_size):
-        action_key, reset_key = jax.random.split(jax.random.fold_in(key, start))
-        data = jax.device_get(rollout(actor, action_key, jax.random.split(reset_key, batch_size)))
-        totals = np.column_stack([data['reward'].sum(0), data['cost'].sum(0), data['valid'].sum(0)])
-        batches.append(totals[:min(batch_size, episodes-start)])
-    totals = np.concatenate(batches)
-    metrics = {'eval/episodes': episodes}
-    for i, name in enumerate(('reward', 'cost', 'episode_length')):
-        metrics[f'eval/{name}'] = float(np.mean(totals[:, i]))
-        metrics[f'eval/{name}_std'] = float(np.std(totals[:, i]))
-    metrics['eval/zero_cost_fraction'] = float(np.mean(totals[:, 1] == 0))
-    metrics['eval/seconds'] = time.perf_counter()-started
-    if return_episodes:
-        return metrics, totals
-    return metrics
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset', required=True, type=Path, help='Completed lidar-edited nominal dataset')
@@ -196,15 +137,11 @@ def main():
     p.add_argument('--learning-rate', type=float, default=5e-4, help='MMD gradient descent step size')
     p.add_argument('--bandwidth', type=float, help='Gaussian kernel width; defaults to median distance')
     p.add_argument('--save-every', type=int, default=10)
-    p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--eval-every', type=int, default=10)
-    p.add_argument('--eval-episodes', type=int, default=128)
-    p.add_argument('--eval-seed', type=int, default=10000)
-    p.add_argument('--final-eval-episodes', type=int, default=512)
-    p.add_argument('--final-eval-seed', type=int, default=60000)
-    p.add_argument('--eval-bootstrap-samples', type=int, default=2000)
-    p.add_argument('--eval-cost-limit', type=float, default=None, help='Optional episode cost budget line on charts')
-    p.add_argument('--video-every', type=int, default=10,
+    p.add_argument('--seed', type=int, default=3)
+    p.add_argument('--num-evals', type=int, default=10)
+    p.add_argument('--num-eval-envs', type=int, default=128)
+    p.add_argument('--deterministic-eval', action='store_true')
+    p.add_argument('--video-every', type=int, default=0,
                    help='Paired diagnostic video initially, every N iterations and finally; 0 disables')
     p.add_argument('--video-seed', type=int, default=20000)
     p.add_argument('--video-stride', type=int, default=4)
@@ -215,13 +152,11 @@ def main():
     p.add_argument('--wandb-name', default=None)
     args = p.parse_args()
     positive = (args.iterations, args.num_envs, args.expert_capacity, args.mmd_samples,
-                args.save_every, args.learning_rate, args.eval_every, args.eval_episodes)
+                args.save_every, args.learning_rate, args.num_eval_envs)
     if min(positive) <= 0 or not 0 < args.gamma <= 1:
         p.error('Counts and tolerances must be positive; 0 < gamma <= 1')
-    if min(args.eval_episodes, args.final_eval_episodes, args.eval_bootstrap_samples) < 2:
-        p.error('Evaluation episode counts and bootstrap samples must be at least 2')
-    if args.final_eval_seed == args.eval_seed:
-        p.error('Final evaluation seed must differ from periodic evaluation seed')
+    if args.num_evals < 0:
+        p.error('Number of evaluations must be nonnegative')
     if args.video_every < 0 or args.video_stride < 1:
         p.error('Video interval must be nonnegative and stride positive')
     manifest = json.loads((args.dataset/'manifest.json').read_text())
@@ -236,7 +171,7 @@ def main():
     if args.output.exists():
         p.error('Use a new output directory')
     path = resolve_checkpoint(args.checkpoint or Path(manifest['checkpoint']))
-    network, params, _, algorithm = load_collection_policy(path)
+    network, params, make_policy, algorithm = load_collection_policy(path)
     normalizer, actor = params[0], params[1]
     theta, unravel = ravel_pytree(actor)
     rng = np.random.default_rng(args.seed)
@@ -255,7 +190,21 @@ def main():
         raise ValueError('Demonstration dimensions do not match environment')
     rollout = make_rollout(env, network, normalizer, horizon)
     mmd_measure, mmd_gradient = make_mmd_update(network, normalizer, unravel)
-    evaluation = make_ppo_evaluation(env, network, normalizer, horizon)
+    eval_iterations = set()
+    evaluators = {}
+    if args.num_evals > 0:
+        eval_env = envs.get_environment(config['env'], level=3)
+        eval_horizon = eval_env.episode_length
+        _, local_key = jax.random.split(jax.random.PRNGKey(args.seed))
+        eval_key = jax.random.split(jax.random.fold_in(local_key, 0), 3)[2]
+        # Separate evaluators advance identical reset and action key streams.
+        for name in ('baseline', 'finetuned'):
+            evaluators[name] = make_ppo_evaluator(
+                eval_env, make_policy, eval_horizon, args.num_eval_envs,
+                eval_key, args.deterministic_eval)
+        eval_iterations = {args.iterations} if args.num_evals == 1 else set(
+            np.linspace(0, args.iterations, min(args.num_evals, args.iterations + 1),
+                        dtype=int).tolist())
     video = None
     if args.video_every:
         from training.agents.counterfactual.policy_video import PairedPolicyVideo
@@ -276,11 +225,9 @@ def main():
                   normalizer='frozen', expert_filter='all nominal episodes; no winner filtering',
                   estimator='normalized discounted occupancy; prefix importance weights; empirical squared MMD',
                   paper='https://arxiv.org/abs/1911.07109')
-    report['evaluation'] = dict(scope='Saved demonstration boards with real added hazards; fixed independent sampling/action randomness; not held-out layouts',
-                                seed=args.eval_seed, episodes=args.eval_episodes,
-                                schedule='before training, every eval-every iterations, and final iteration',
-                                policy='stochastic')
-    report['evaluation']['final_test'] = dict(seed=args.final_eval_seed, episodes=args.final_eval_episodes)
+    report['evaluation'] = dict(env=config['env'], level=3, iterations=sorted(eval_iterations),
+                                episodes_per_policy=args.num_eval_envs, seed=args.seed,
+                                deterministic=args.deterministic_eval)
     report['video'] = dict(enabled=video is not None, every=args.video_every,
                           seed=args.video_seed, scope='Current actor on added-hazard demonstration board '
                           'versus recorded nominal expert; fixed example from the training board bank',
@@ -298,40 +245,18 @@ def main():
         run_log.define_metric('iteration')
         run_log.define_metric('num_steps')
         run_log.define_metric('train/*', step_metric='num_steps')
-        run_log.define_metric('eval/*', step_metric='num_steps')
-        run_log.define_metric('test/*', step_metric='num_steps')
+        for name in evaluators:
+            run_log.define_metric(f'{name}/eval/*', step_metric='num_steps')
         run_log.define_metric('video/*', step_metric='num_steps')
-        from training.agents.counterfactual.evaluation_report import save_report, METRICS
-        evaluation_baseline = None
-        def publish_comparison(before, after, seed, iteration, namespace, directory):
-            summary = save_report(directory, before, after, seed, iteration,
-                                  args.eval_bootstrap_samples, args.eval_cost_limit)
-            table = wandb.Table(columns=['episode', 'eval_seed'] +
-                               [f'{side}_{m}' for side in ('before','after') for m in METRICS],
-                               data=[[i, seed, *b.tolist(), *a.tolist()]
-                                     for i,(b,a) in enumerate(zip(before,after))])
-            payload = {'iteration': iteration, 'num_steps': environment_steps,
-                       f'{namespace}/comparison': wandb.Image(str(directory/'comparison.png')),
-                       f'{namespace}/episode_results': table}
-            for metric, values in summary['metrics'].items():
-                for label, value in values.items():
-                    prefix = f'{namespace}/{metric}_{label}'
-                    payload[prefix] = value['mean']
-                    payload[prefix+'_ci_low'], payload[prefix+'_ci_high'] = value['ci95']
-            run_log.log(payload, step=environment_steps, commit=False)
 
         def evaluate(iteration):
-            nonlocal evaluation_baseline
-            metrics, episodes = evaluation(unravel(theta), args.eval_seed, args.eval_episodes)
-            if evaluation_baseline is None:
-                evaluation_baseline = episodes.copy()
-            publish_comparison(evaluation_baseline, episodes, args.eval_seed, iteration, 'eval',
-                               args.output/'evaluation'/f'{iteration:06d}')
-            record = dict(iteration=iteration, num_steps=environment_steps, **metrics)
+            record = dict(iteration=iteration, num_steps=environment_steps)
+            current_params = (params[0], unravel(theta), *params[2:])
+            for name, policy_params in [('baseline', params), ('finetuned', current_params)]:
+                metrics = evaluators[name].run_evaluation(policy_params, {})
+                record.update({f'{name}/{k}': float(v) for k, v in metrics.items()})
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
             run_log.log(record, step=environment_steps, commit=False)
-            for name, value in metrics.items():
-                run_log.summary[name] = value
             print(json.dumps(record), flush=True)
 
         def publish_video(iteration):
@@ -344,7 +269,8 @@ def main():
                                      'original hazards: red. Separate diagnostic rollout.')},
                         step=environment_steps, commit=False)
 
-        evaluate(0)
+        if 0 in eval_iterations:
+            evaluate(0)
         publish_video(0)
         run_log.log({}, step=0, commit=True)
         for iteration in range(1, args.iterations+1):
@@ -391,21 +317,11 @@ def main():
                 updated = list(params); updated[1] = unravel(theta)
                 checkpoint_io.save(args.output/'checkpoint', iteration, tuple(updated), checkpoint_config, config_name)
                 run_log.summary['saved_checkpoint'] = str((args.output/'checkpoint'/f'{iteration:012d}').resolve())
-            if iteration % args.eval_every == 0 or iteration == args.iterations:
+            if iteration in eval_iterations:
                 evaluate(iteration)
             if video is not None and (iteration % args.video_every == 0 or iteration == args.iterations):
                 publish_video(iteration)
-            if iteration != args.iterations:
-                run_log.log({}, step=environment_steps, commit=True)
-        # Untouched test randomness, used only after training finishes. The
-        # original actor and final actor share reset/action keys for pairing.
-        _, test_before = evaluation(actor, args.final_eval_seed, args.final_eval_episodes)
-        test_metrics, test_after = evaluation(unravel(theta), args.final_eval_seed, args.final_eval_episodes)
-        publish_comparison(test_before, test_after, args.final_eval_seed, args.iterations,
-                           'test', args.output/'independent_evaluation')
-        run_log.log({'iteration': args.iterations, 'num_steps': environment_steps,
-                     **{k.replace('eval/', 'test/'): v for k,v in test_metrics.items()}},
-                    step=environment_steps, commit=True)
+            run_log.log({}, step=environment_steps, commit=True)
     print(f'Saved fine-tuned checkpoint: {args.output}/checkpoint/{args.iterations:012d}',flush=True)
 
 
