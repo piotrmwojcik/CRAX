@@ -248,8 +248,9 @@ def main():
     distances = np.sqrt(np.maximum(((probe[:, None]-probe[None, :])**2).sum(-1), 0.))
     nonzero = distances[distances > 0]
     bandwidth = args.bandwidth or (float(np.median(nonzero)) if len(nonzero) else 1.)
-    env = wrappers.wrap(envs.get_environment(config['env'], level=config['level']),
-                        episode_length=horizon, action_repeat=1)
+    from training.agents.counterfactual.demonstration_env import make_demonstration_env
+    board_env, board_ids = make_demonstration_env(args.dataset, manifest)
+    env = wrappers.wrap(board_env, episode_length=horizon, action_repeat=1)
     if expert.shape[1] != env.observation_size + env.action_size:
         raise ValueError('Demonstration dimensions do not match environment')
     rollout = make_rollout(env, network, normalizer, horizon)
@@ -266,20 +267,23 @@ def main():
     report = dict(configuration={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
                   source_checkpoint=str(path), demonstrations=counts, bandwidth=bandwidth,
                   method='MMD imitation: theta <- theta - learning_rate * grad(MMD squared)',
-                  online_environment=dict(env=config['env'], level=config['level'], episode_length=horizon),
+                  online_environment=dict(env=config['env'], level=config['level'], episode_length=horizon,
+                      reset='Uniform sampling of saved demonstration episode boards and initial states',
+                      added_hazards='Real, lidar-visible and cost-active, with recorded widths',
+                      board_ids=board_ids),
                   objective='MMD squared only; reward and safety cost are evaluation metrics',
                   expert_policy=str(manifest['checkpoint']),
                   normalizer='frozen', expert_filter='all nominal episodes; no winner filtering',
                   estimator='normalized discounted occupancy; prefix importance weights; empirical squared MMD',
                   paper='https://arxiv.org/abs/1911.07109')
-    report['evaluation'] = dict(scope='standard real-hazard environment, independent fixed reset/action randomness',
+    report['evaluation'] = dict(scope='Saved demonstration boards with real added hazards; fixed independent sampling/action randomness; not held-out layouts',
                                 seed=args.eval_seed, episodes=args.eval_episodes,
                                 schedule='before training, every eval-every iterations, and final iteration',
                                 policy='stochastic')
     report['evaluation']['final_test'] = dict(seed=args.final_eval_seed, episodes=args.final_eval_episodes)
     report['video'] = dict(enabled=video is not None, every=args.video_every,
                           seed=args.video_seed, scope='Current actor on added-hazard demonstration board '
-                          'versus recorded nominal expert; separate from standard-environment evaluation',
+                          'versus recorded nominal expert; fixed example from the training board bank',
                           colors=dict(original='red', current_added='yellow', nominal_added='blue'))
     (args.output/'run.json').write_text(json.dumps(report, indent=2))
     np.savez(args.output/'mmd_features.npz', mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)

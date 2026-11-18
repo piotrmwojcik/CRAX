@@ -146,7 +146,7 @@ class PairedPolicyVideo:
                         f'{label}\nIteration {iteration} | Step {t}/{len(q)-1} | '
                         f'{"ENDED" if t == len(q)-1 else "RUNNING"}\n'
                         f'Reward {totals[index][0][t]:.3f} | Cost {totals[index][1][t]:.3f}\n'
-                        'Original hazards: RED | paired diagnostic, separate from evaluation', fill='white', spacing=3)
+                        'Original hazards: RED | fixed demonstration-board diagnostic', fill='white', spacing=3)
                     panels.append(np.asarray(panel))
                 writer.append_data(np.concatenate(panels, axis=1))
         metadata = dict(iteration=iteration, env_index=self.example['env_index'],
