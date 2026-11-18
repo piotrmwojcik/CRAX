@@ -204,6 +204,11 @@ def main():
     p.add_argument('--final-eval-seed', type=int, default=60000)
     p.add_argument('--eval-bootstrap-samples', type=int, default=2000)
     p.add_argument('--eval-cost-limit', type=float, default=None, help='Optional episode cost budget line on charts')
+    p.add_argument('--video-every', type=int, default=10,
+                   help='Paired diagnostic video initially, every N iterations and finally; 0 disables')
+    p.add_argument('--video-seed', type=int, default=20000)
+    p.add_argument('--video-stride', type=int, default=4)
+    p.add_argument('--video-camera', default='fixedfar')
     p.add_argument('--wandb-mode', choices=('online', 'offline', 'disabled'), default='disabled')
     p.add_argument('--wandb-project', default='crax')
     p.add_argument('--wandb-entity', default=None)
@@ -217,6 +222,8 @@ def main():
         p.error('Evaluation episode counts and bootstrap samples must be at least 2')
     if args.final_eval_seed == args.eval_seed:
         p.error('Final evaluation seed must differ from periodic evaluation seed')
+    if args.video_every < 0 or args.video_stride < 1:
+        p.error('Video interval must be nonnegative and stride positive')
     manifest = json.loads((args.dataset/'manifest.json').read_text())
     if manifest.get('status') != 'complete' or not manifest.get('lidar_edit'):
         p.error('Provide a completed lidar-edited dataset')
@@ -248,6 +255,11 @@ def main():
     rollout = make_rollout(env, network, normalizer, horizon)
     mmd_measure, mmd_gradient = make_mmd_update(network, normalizer, unravel)
     evaluation = make_ppo_evaluation(env, network, normalizer, horizon)
+    video = None
+    if args.video_every:
+        from training.agents.counterfactual.policy_video import PairedPolicyVideo
+        video = PairedPolicyVideo(args.dataset, manifest, network, normalizer, horizon,
+                                  args.video_seed, args.video_stride, args.video_camera)
     config_name = 'ppo_network_config.json' if algorithm == 'ppo' else 'sac_network_config.json'
     checkpoint_config = checkpoint_io.load_config(path/config_name)
     args.output.mkdir(parents=True)
@@ -265,6 +277,10 @@ def main():
                                 schedule='before training, every eval-every iterations, and final iteration',
                                 policy='stochastic')
     report['evaluation']['final_test'] = dict(seed=args.final_eval_seed, episodes=args.final_eval_episodes)
+    report['video'] = dict(enabled=video is not None, every=args.video_every,
+                          seed=args.video_seed, scope='Current actor on added-hazard demonstration board '
+                          'versus recorded nominal expert; separate from standard-environment evaluation',
+                          colors=dict(original='red', current_added='yellow', nominal_added='blue'))
     (args.output/'run.json').write_text(json.dumps(report, indent=2))
     np.savez(args.output/'mmd_features.npz', mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)
     environment_steps = 0
@@ -280,6 +296,7 @@ def main():
         run_log.define_metric('train/*', step_metric='num_steps')
         run_log.define_metric('eval/*', step_metric='num_steps')
         run_log.define_metric('test/*', step_metric='num_steps')
+        run_log.define_metric('video/*', step_metric='num_steps')
         from training.agents.counterfactual.evaluation_report import save_report, METRICS
         evaluation_baseline = None
         def publish_comparison(before, after, seed, iteration, namespace, directory):
@@ -313,7 +330,18 @@ def main():
                 run_log.summary[name] = value
             print(json.dumps(record), flush=True)
 
+        def publish_video(iteration):
+            if video is None:
+                return
+            filename, fps = video.write(unravel(theta), args.output/'videos'/f'{iteration:06d}', iteration)
+            run_log.log({'iteration': iteration, 'num_steps': environment_steps,
+                         'video/current_vs_nominal': wandb.Video(str(filename), fps=fps, format='mp4',
+                             caption='Current policy: yellow added hazards; recorded nominal expert: blue; '
+                                     'original hazards: red. Separate diagnostic rollout.')},
+                        step=environment_steps, commit=False)
+
         evaluate(0)
+        publish_video(0)
         run_log.log({}, step=0, commit=True)
         for iteration in range(1, args.iterations+1):
             started = time.perf_counter()
@@ -361,6 +389,8 @@ def main():
                 run_log.summary['saved_checkpoint'] = str((args.output/'checkpoint'/f'{iteration:012d}').resolve())
             if iteration % args.eval_every == 0 or iteration == args.iterations:
                 evaluate(iteration)
+            if video is not None and (iteration % args.video_every == 0 or iteration == args.iterations):
+                publish_video(iteration)
             if iteration != args.iterations:
                 run_log.log({}, step=environment_steps, commit=True)
         # Untouched test randomness, used only after training finishes. The

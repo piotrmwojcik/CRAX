@@ -34,6 +34,10 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --eval-seed "${EVAL_SEED:-10000}" \
   --final-eval-episodes "${FINAL_EVAL_EPISODES:-512}" \
   --final-eval-seed "${FINAL_EVAL_SEED:-60000}" \
+  --video-every "${VIDEO_EVERY:-10}" \
+  --video-seed "${VIDEO_SEED:-20000}" \
+  --video-stride "${VIDEO_STRIDE:-4}" \
+  --video-camera "${VIDEO_CAMERA:-fixedfar}" \
   --wandb-mode "${WANDB_MODE:-online}" \
   --wandb-project "${WANDB_PROJECT:-crax}" \
   --wandb-name "${WANDB_NAME:-mmd-imitation-${SLURM_JOB_ID}}" \
