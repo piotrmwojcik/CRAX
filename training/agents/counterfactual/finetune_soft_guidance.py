@@ -258,6 +258,7 @@ def main():
         for name in evaluators:
             run_log.define_metric(f'{name}/eval/*', step_metric='num_steps')
         run_log.define_metric('video/*', step_metric='num_steps')
+        evaluation_history = []
 
         def evaluate(iteration):
             record = dict(iteration=iteration, num_steps=environment_steps)
@@ -267,6 +268,21 @@ def main():
                 record.update({f'{name}/{k}': float(v) for k, v in metrics.items()})
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
             run_log.log(record, step=environment_steps, commit=False)
+            if args.wandb_mode != 'disabled':
+                evaluation_history.append(record)
+                steps = [row['num_steps'] for row in evaluation_history]
+                charts = {}
+                for key in record:
+                    if not key.startswith('baseline/eval/'):
+                        continue
+                    metric = key.removeprefix('baseline/eval/')
+                    charts[f'eval_comparison/{metric}'] = wandb.plot.line_series(
+                        xs=steps,
+                        ys=[[row[f'{policy}/eval/{metric}'] for row in evaluation_history]
+                            for policy in ('baseline', 'finetuned')],
+                        keys=['Baseline', 'Fine-tuned'], title=metric, xname='num_steps',
+                        split_table=True)
+                run_log.log(charts, step=environment_steps, commit=False)
             print(json.dumps(record), flush=True)
 
         def publish_video(iteration):
