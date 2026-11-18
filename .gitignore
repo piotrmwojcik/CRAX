@@ -20,6 +20,7 @@ __pycache__
 /runs/
 /trajectories/
 /visualizations/
+/visualization*/
 
 
 
@@ -30,9 +31,16 @@ notebooks/*.png
 notebooks/*_checkpoints/
 
 # Results aggregation
+/results/
 /plots/
 /results/data/
 /results/figures/
+
+# Local collection checks and rollout artifacts
+/results/checkpoint_stochastic_128_eval.json
+/results/compiled_collection_check/
+/results/counterfactual_level1_500m/
+/results/counterfactual_ppo_collection_*/
 
 # Generated plots directory
 /videos/

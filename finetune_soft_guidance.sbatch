@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=crax-soft-guidance
+#SBATCH --job-name=crax-mmd-imitation
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -27,16 +27,14 @@ srun python -u -m training.agents.counterfactual.finetune_soft_guidance \
   --output "${OUTPUT_DIR:-results/soft_guidance_${SLURM_JOB_ID}}" \
   --iterations "${ITERATIONS:-100}" \
   --num-envs "${NUM_ENVS:-16}" \
-  --initial-tolerance "${INITIAL_TOLERANCE:-0.05}" \
-  --annealing "${ANNEALING:-0.01}" \
-  --max-kl "${MAX_KL:-0.01}" \
+  --learning-rate "${LEARNING_RATE:-0.0005}" \
   --seed "${SEED:-0}" \
   --eval-every "${EVAL_EVERY:-10}" \
-  --eval-episodes "${EVAL_EPISODES:-64}" \
+  --eval-episodes "${EVAL_EPISODES:-128}" \
   --eval-seed "${EVAL_SEED:-10000}" \
   --final-eval-episodes "${FINAL_EVAL_EPISODES:-512}" \
   --final-eval-seed "${FINAL_EVAL_SEED:-60000}" \
   --wandb-mode "${WANDB_MODE:-online}" \
   --wandb-project "${WANDB_PROJECT:-crax}" \
-  --wandb-name "${WANDB_NAME:-soft-guidance-${SLURM_JOB_ID}}" \
+  --wandb-name "${WANDB_NAME:-mmd-imitation-${SLURM_JOB_ID}}" \
   "${checkpoint_args[@]}"

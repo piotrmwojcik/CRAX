@@ -1,8 +1,4 @@
-"""Online fine-tuning with nominal demonstrations and soft MMD guidance.
-
-An implementation of Algorithm 1 in https://arxiv.org/abs/1911.07109,
-with explicit finite-horizon, squared-MMD estimator choices; see README.
-"""
+"""Online imitation by gradient descent on squared MMD to one expert dataset."""
 import argparse
 import json
 from pathlib import Path
@@ -15,7 +11,7 @@ import numpy as np
 
 from crax import envs
 from crax.envs.wrappers import training as wrappers
-from training import checkpoint as checkpoint_io
+from training import acting, checkpoint as checkpoint_io
 from training.agents.counterfactual.collect_rollouts import resolve_checkpoint, load_collection_policy
 from training.agents.counterfactual.hazard_comparison import iter_episodes
 from training.agents.counterfactual.soft_guidance import (
@@ -73,7 +69,65 @@ def make_rollout(env, network, normalizer, horizon):
     return rollout
 
 
+def make_mmd_update(network, normalizer, unravel):
+    """Score-function occupancy gradient; rewards and costs are not inputs."""
+    def discrepancy(theta, data, indices, kernels):
+        logits = network.policy_network.apply(normalizer, unravel(theta), data['obs'])
+        log_ratio = network.parametric_action_distribution.log_prob(logits, data['raw']) - data['logp']
+        prefix = jnp.cumsum(jnp.where(data['valid'], log_ratio, 0.), axis=0)
+        weights = jax.nn.softmax(prefix.reshape(-1)[indices])
+        return weighted_mmd(weights, *kernels)
+    return jax.jit(discrepancy), jax.jit(jax.grad(discrepancy))
+
+
+def make_ppo_evaluation(env, network, normalizer, horizon):
+    """Use PPO's EvalWrapper and generate_unroll with its metric conventions.
+
+    Keep fixed reset/action keys for paired comparisons and retain individual
+    episode totals, unlike the aggregate-only default of acting.Evaluator.
+    """
+    eval_env = wrappers.EvalWrapper(env)
+    walltime = 0.
+
+    @jax.jit
+    def run(actor, reset_keys, key):
+        def policy(obs, action_key):
+            logits = network.policy_network.apply(normalizer, actor, obs)
+            dist = network.parametric_action_distribution
+            return dist.sample(logits, action_key), {}
+        state = eval_env.reset(reset_keys)
+        state, _ = acting.generate_unroll(eval_env, state, policy, key, horizon)
+        return state.info['eval_metrics']
+
+    def evaluate(actor, seed, episodes):
+        nonlocal walltime
+        started = time.perf_counter()
+        # Match the first evaluation key split in acting.Evaluator.
+        _, key = jax.random.split(jax.random.PRNGKey(seed))
+        result = jax.device_get(run(actor, jax.random.split(key, episodes), key))
+        seconds = time.perf_counter() - started
+        walltime += seconds
+        metrics = {}
+        for name, values in result.episode_metrics.items():
+            metrics[f'eval/episode_{name}'] = float(np.mean(values))
+            metrics[f'eval/episode_{name}_std'] = float(np.std(values))
+        metrics.update({
+            'eval/avg_episode_length': float(np.mean(result.episode_steps)),
+            'eval/std_episode_length': float(np.std(result.episode_steps)),
+            'eval/epoch_eval_time': seconds,
+            'eval/sps': horizon * episodes / seconds,
+            'eval/walltime': walltime,
+            'eval/episodes': episodes,
+            'eval/zero_cost_fraction': float(np.mean(result.episode_metrics['cost'] == 0)),
+        })
+        totals = np.column_stack([result.episode_metrics['reward'],
+                                  result.episode_metrics['cost'], result.episode_steps])
+        return metrics, totals
+    return evaluate
+
+
 def make_update(network, normalizer, unravel):
+    """Legacy constrained updater, retained for regression tests; not used by main."""
     distribution = network.parametric_action_distribution
     def stats(theta, obs):
         logits = network.policy_network.apply(normalizer, unravel(theta), obs)
@@ -138,19 +192,13 @@ def main():
     p.add_argument('--episode-length', type=int, help='Defaults to dataset episode length')
     p.add_argument('--expert-capacity', type=int, default=100000)
     p.add_argument('--mmd-samples', type=int, default=512)
-    p.add_argument('--kl-samples', type=int, default=2048)
     p.add_argument('--gamma', type=float, default=.99)
-    p.add_argument('--initial-tolerance', type=float, default=.05, help='Squared normalized MMD bound')
-    p.add_argument('--annealing', type=float, default=.01)
-    p.add_argument('--max-kl', type=float, default=.01)
-    p.add_argument('--damping', type=float, default=.01)
-    p.add_argument('--cg-iterations', type=int, default=10)
-    p.add_argument('--backtracks', type=int, default=15)
+    p.add_argument('--learning-rate', type=float, default=5e-4, help='MMD gradient descent step size')
     p.add_argument('--bandwidth', type=float, help='Gaussian kernel width; defaults to median distance')
     p.add_argument('--save-every', type=int, default=10)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--eval-every', type=int, default=10)
-    p.add_argument('--eval-episodes', type=int, default=64)
+    p.add_argument('--eval-episodes', type=int, default=128)
     p.add_argument('--eval-seed', type=int, default=10000)
     p.add_argument('--final-eval-episodes', type=int, default=512)
     p.add_argument('--final-eval-seed', type=int, default=60000)
@@ -162,10 +210,9 @@ def main():
     p.add_argument('--wandb-name', default=None)
     args = p.parse_args()
     positive = (args.iterations, args.num_envs, args.expert_capacity, args.mmd_samples,
-                args.kl_samples, args.cg_iterations, args.backtracks, args.save_every,
-                args.initial_tolerance, args.max_kl, args.damping, args.eval_every, args.eval_episodes)
-    if min(positive) <= 0 or not 0 < args.gamma <= 1 or args.annealing < 0:
-        p.error('Counts and tolerances must be positive; 0 < gamma <= 1; annealing >= 0')
+                args.save_every, args.learning_rate, args.eval_every, args.eval_episodes)
+    if min(positive) <= 0 or not 0 < args.gamma <= 1:
+        p.error('Counts and tolerances must be positive; 0 < gamma <= 1')
     if min(args.eval_episodes, args.final_eval_episodes, args.eval_bootstrap_samples) < 2:
         p.error('Evaluation episode counts and bootstrap samples must be at least 2')
     if args.final_eval_seed == args.eval_seed:
@@ -199,15 +246,17 @@ def main():
     if expert.shape[1] != env.observation_size + env.action_size:
         raise ValueError('Demonstration dimensions do not match environment')
     rollout = make_rollout(env, network, normalizer, horizon)
-    measures, reward_grad, discrepancy_grad, hvp = make_update(network, normalizer, unravel)
+    mmd_measure, mmd_gradient = make_mmd_update(network, normalizer, unravel)
+    evaluation = make_ppo_evaluation(env, network, normalizer, horizon)
     config_name = 'ppo_network_config.json' if algorithm == 'ppo' else 'sac_network_config.json'
     checkpoint_config = checkpoint_io.load_config(path/config_name)
     args.output.mkdir(parents=True)
     report = dict(configuration={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
                   source_checkpoint=str(path), demonstrations=counts, bandwidth=bandwidth,
-                  method='Soft expert guidance: MMD squared, KL trust region, recovery, annealed tolerance',
+                  method='MMD imitation: theta <- theta - learning_rate * grad(MMD squared)',
                   online_environment=dict(env=config['env'], level=config['level'], episode_length=horizon),
-                  objective='environment reward; safety cost logged but not constrained',
+                  objective='MMD squared only; reward and safety cost are evaluation metrics',
+                  expert_policy=str(manifest['checkpoint']),
                   normalizer='frozen', expert_filter='all nominal episodes; no winner filtering',
                   estimator='normalized discounted occupancy; prefix importance weights; empirical squared MMD',
                   paper='https://arxiv.org/abs/1911.07109')
@@ -218,7 +267,7 @@ def main():
     report['evaluation']['final_test'] = dict(seed=args.final_eval_seed, episodes=args.final_eval_episodes)
     (args.output/'run.json').write_text(json.dumps(report, indent=2))
     np.savez(args.output/'mmd_features.npz', mean=feature_mean, scale=feature_scale, bandwidth=bandwidth)
-    tolerance = args.initial_tolerance
+    environment_steps = 0
     key = jax.random.PRNGKey(args.seed)
     import wandb
     with wandb.init(project=args.wandb_project, entity=args.wandb_entity,
@@ -227,9 +276,10 @@ def main():
             (args.output/'metrics.jsonl').open('w') as log, \
             (args.output/'evaluation.jsonl').open('w') as eval_log:
         run_log.define_metric('iteration')
-        run_log.define_metric('train/*', step_metric='iteration')
-        run_log.define_metric('eval/*', step_metric='iteration')
-        run_log.define_metric('test/*', step_metric='iteration')
+        run_log.define_metric('num_steps')
+        run_log.define_metric('train/*', step_metric='num_steps')
+        run_log.define_metric('eval/*', step_metric='num_steps')
+        run_log.define_metric('test/*', step_metric='num_steps')
         from training.agents.counterfactual.evaluation_report import save_report, METRICS
         evaluation_baseline = None
         def publish_comparison(before, after, seed, iteration, namespace, directory):
@@ -239,7 +289,7 @@ def main():
                                [f'{side}_{m}' for side in ('before','after') for m in METRICS],
                                data=[[i, seed, *b.tolist(), *a.tolist()]
                                      for i,(b,a) in enumerate(zip(before,after))])
-            payload = {'iteration': iteration,
+            payload = {'iteration': iteration, 'num_steps': environment_steps,
                        f'{namespace}/comparison': wandb.Image(str(directory/'comparison.png')),
                        f'{namespace}/episode_results': table}
             for metric, values in summary['metrics'].items():
@@ -247,24 +297,24 @@ def main():
                     prefix = f'{namespace}/{metric}_{label}'
                     payload[prefix] = value['mean']
                     payload[prefix+'_ci_low'], payload[prefix+'_ci_high'] = value['ci95']
-            run_log.log(payload)
+            run_log.log(payload, step=environment_steps, commit=False)
 
         def evaluate(iteration):
             nonlocal evaluation_baseline
-            metrics, episodes = evaluate_policy(rollout, unravel(theta), args.eval_seed,
-                                                args.eval_episodes, return_episodes=True)
+            metrics, episodes = evaluation(unravel(theta), args.eval_seed, args.eval_episodes)
             if evaluation_baseline is None:
                 evaluation_baseline = episodes.copy()
             publish_comparison(evaluation_baseline, episodes, args.eval_seed, iteration, 'eval',
                                args.output/'evaluation'/f'{iteration:06d}')
-            record = dict(iteration=iteration, **metrics)
+            record = dict(iteration=iteration, num_steps=environment_steps, **metrics)
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
-            run_log.log(record)
+            run_log.log(record, step=environment_steps, commit=False)
             for name, value in metrics.items():
                 run_log.summary[name] = value
             print(json.dumps(record), flush=True)
 
         evaluate(0)
+        run_log.log({}, step=0, commit=True)
         for iteration in range(1, args.iterations+1):
             started = time.perf_counter()
             key, action_key, reset_key = jax.random.split(key, 3)
@@ -273,76 +323,55 @@ def main():
             occupancy = valid * args.gamma**np.arange(horizon)[:, None]
             probability = occupancy.reshape(-1)/occupancy.sum()
             indices = rng.choice(len(probability), args.mmd_samples, p=probability)
-            kl_indices = rng.choice(len(probability), args.kl_samples, p=probability)
             online = np.concatenate([np.asarray(data['obs']),np.asarray(data['action'])],axis=-1).reshape(-1, expert.shape[1])
             online = (online[indices]-feature_mean)/feature_scale
             demos = expert[rng.integers(len(expert),size=args.mmd_samples)]
             kernels = tuple(gaussian_kernel(jnp.asarray(x),jnp.asarray(y),bandwidth)
                             for x,y in ((online,online),(online,demos),(demos,demos)))
-            returns = discounted_returns(data['reward'],data['valid'],args.gamma)
-            # State-independent baseline at each timestep, estimated across lanes.
-            # Leave-one-out baseline avoids cancelling the policy gradient
-            # with a lane's own return (especially with a single environment).
-            other_count = data['valid'].sum(1,keepdims=True)-data['valid']
-            baseline = jnp.where(other_count > 0,
-                (returns.sum(1,keepdims=True)-returns)/jnp.maximum(other_count,1), 0.)
-            advantage = (returns-baseline)*data['valid']
-            data = dict(data, advantage=advantage/(jnp.std(advantage)+1e-8),
-                        occupancy=jnp.asarray(occupancy/occupancy.sum(),dtype=jnp.float32),
-                        kl_obs=data['obs'].reshape(-1,data['obs'].shape[-1])[kl_indices])
             indices = jnp.asarray(indices)
             old = theta
-            arguments = (old,data,indices,kernels)
-            objective, discrepancy, _ = map(float,measures(old,*arguments))
-            g, b = reward_grad(old,*arguments), discrepancy_grad(old,*arguments)
-            if not np.isfinite(np.asarray(g)).all() or not np.isfinite(np.asarray(b)).all():
-                raise FloatingPointError('Nonfinite policy gradients')
-            matvec = lambda v: hvp(old,v,*arguments,args.damping)
-            u = conjugate_gradient(matvec,g,args.cg_iterations)
-            r = conjugate_gradient(matvec,b,args.cg_iterations)
-            step, mode = constrained_step(g,b,u,r,tolerance-discrepancy,args.max_kl)
-            accepted = False
-            new_values = (objective,discrepancy,0.)
-            fraction = 0.
-            for backtrack in range(args.backtracks):
-                candidate_fraction = .5**backtrack
-                candidate = old + candidate_fraction*step
-                reward, distance, kl = map(float,measures(candidate,*arguments))
-                finite = np.isfinite([reward,distance,kl]).all()
-                recovery = mode.startswith('infeasible') or mode == 'recovery'
-                satisfies = distance < discrepancy if recovery else distance <= tolerance
-                improves = recovery or discrepancy > tolerance or reward >= objective
-                if finite and kl <= args.max_kl and satisfies and improves and np.linalg.norm(np.asarray(step)) > 0:
-                    theta, new_values, fraction, accepted = candidate,(reward,distance,kl),candidate_fraction,True
-                    break
-            row = dict(iteration=iteration, accepted=accepted, mode=mode, step_fraction=fraction,
-                       tolerance=tolerance, mmd_before=discrepancy, mmd_after=new_values[1], kl=new_values[2],
-                       surrogate_before=objective,surrogate_after=new_values[0],
+            discrepancy = float(mmd_measure(old, data, indices, kernels))
+            gradient = mmd_gradient(old, data, indices, kernels)
+            if not np.isfinite(np.asarray(gradient)).all():
+                raise FloatingPointError('Nonfinite MMD gradient')
+            theta = old - args.learning_rate * gradient
+            if not np.isfinite(np.asarray(theta)).all():
+                raise FloatingPointError('Nonfinite actor parameters')
+            after = float(mmd_measure(theta, data, indices, kernels))
+            # The full scan executes horizon steps in every lane, including
+            # masked post-termination steps, as PPO evaluation does.
+            environment_steps += horizon * args.num_envs
+            row = dict(iteration=iteration, num_steps=environment_steps,
+                       mode='mmd_gradient_descent', learning_rate=args.learning_rate,
+                       mmd_before=discrepancy, mmd_after=after,
+                       gradient_norm=float(jnp.linalg.norm(gradient)),
+                       update_norm=float(jnp.linalg.norm(theta-old)),
                        rollout_reward=float(data['reward'].sum()/args.num_envs),
                        rollout_cost=float(data['cost'].sum()/args.num_envs),
                        rollout_steps=float(data['valid'].sum()/args.num_envs),
                        seconds=time.perf_counter()-started)
             log.write(json.dumps(row)+'\n'); log.flush()
             print(json.dumps(row),flush=True)
-            run_log.log({'iteration': iteration,
-                         **{f'train/{k}': v for k, v in row.items() if k != 'iteration'}})
-            tolerance *= 1+args.annealing
+            run_log.log({'iteration': iteration, 'num_steps': environment_steps,
+                         **{f'train/{k}': v for k, v in row.items() if k not in ('iteration', 'num_steps')}},
+                        step=environment_steps, commit=False)
             if iteration % args.save_every == 0 or iteration == args.iterations:
                 updated = list(params); updated[1] = unravel(theta)
                 checkpoint_io.save(args.output/'checkpoint', iteration, tuple(updated), checkpoint_config, config_name)
                 run_log.summary['saved_checkpoint'] = str((args.output/'checkpoint'/f'{iteration:012d}').resolve())
             if iteration % args.eval_every == 0 or iteration == args.iterations:
                 evaluate(iteration)
+            if iteration != args.iterations:
+                run_log.log({}, step=environment_steps, commit=True)
         # Untouched test randomness, used only after training finishes. The
         # original actor and final actor share reset/action keys for pairing.
-        _, test_before = evaluate_policy(rollout, actor, args.final_eval_seed,
-                                         args.final_eval_episodes, return_episodes=True)
-        test_metrics, test_after = evaluate_policy(rollout, unravel(theta), args.final_eval_seed,
-                                                   args.final_eval_episodes, return_episodes=True)
+        _, test_before = evaluation(actor, args.final_eval_seed, args.final_eval_episodes)
+        test_metrics, test_after = evaluation(unravel(theta), args.final_eval_seed, args.final_eval_episodes)
         publish_comparison(test_before, test_after, args.final_eval_seed, args.iterations,
                            'test', args.output/'independent_evaluation')
-        run_log.log({'iteration': args.iterations,
-                     **{k.replace('eval/', 'test/'): v for k,v in test_metrics.items()}})
+        run_log.log({'iteration': args.iterations, 'num_steps': environment_steps,
+                     **{k.replace('eval/', 'test/'): v for k,v in test_metrics.items()}},
+                    step=environment_steps, commit=True)
     print(f'Saved fine-tuned checkpoint: {args.output}/checkpoint/{args.iterations:012d}',flush=True)
 
 
