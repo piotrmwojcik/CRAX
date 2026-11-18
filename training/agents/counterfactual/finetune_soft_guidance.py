@@ -208,10 +208,14 @@ def main():
         _, local_key = jax.random.split(jax.random.PRNGKey(args.seed))
         eval_key = jax.random.split(jax.random.fold_in(local_key, 0), 3)[2]
         # Separate evaluators advance identical reset and action key streams.
-        for name in ('baseline', 'finetuned'):
-            evaluators[name] = make_ppo_evaluator(
-                eval_env, make_policy, eval_horizon, args.num_eval_envs,
-                eval_key, args.deterministic_eval)
+        for scope, evaluation_env, length, key in (
+            ('eval', eval_env, eval_horizon, eval_key),
+            ('expert_eval', board_env, horizon, jax.random.fold_in(eval_key, 1)),
+        ):
+            for policy in ('baseline', 'finetuned'):
+                evaluators[policy, scope] = make_ppo_evaluator(
+                    evaluation_env, make_policy, length, args.num_eval_envs,
+                    key, args.deterministic_eval)
         eval_iterations = {args.iterations} if args.num_evals == 1 else set(
             np.linspace(0, args.iterations, min(args.num_evals, args.iterations + 1),
                         dtype=int).tolist())
@@ -237,6 +241,7 @@ def main():
                   paper='https://arxiv.org/abs/1911.07109')
     report['evaluation'] = dict(env=config['env'], level=3, iterations=sorted(eval_iterations),
                                 episodes_per_policy=args.num_eval_envs, seed=args.seed,
+                                expert_eval='Uniform resets on the training demonstration boards with real added hazards',
                                 deterministic=args.deterministic_eval)
     report['video'] = dict(enabled=video is not None, every=args.video_every,
                           seed=args.video_seed, scope='Current actor on added-hazard demonstration board '
@@ -255,33 +260,44 @@ def main():
         run_log.define_metric('iteration')
         run_log.define_metric('num_steps')
         run_log.define_metric('train/*', step_metric='num_steps')
-        for name in evaluators:
-            run_log.define_metric(f'{name}/eval/*', step_metric='num_steps')
+        for policy, scope in evaluators:
+            run_log.define_metric(f'{policy}/{scope}/*', step_metric='num_steps')
         run_log.define_metric('video/*', step_metric='num_steps')
         evaluation_history = []
 
         def evaluate(iteration):
             record = dict(iteration=iteration, num_steps=environment_steps)
             current_params = (params[0], unravel(theta), *params[2:])
-            for name, policy_params in [('baseline', params), ('finetuned', current_params)]:
-                metrics = evaluators[name].run_evaluation(policy_params, {})
-                record.update({f'{name}/{k}': float(v) for k, v in metrics.items()})
+            policy_params = {'baseline': params, 'finetuned': current_params}
+            for (policy, scope), evaluator in evaluators.items():
+                metrics = evaluator.run_evaluation(policy_params[policy], {})
+                metrics['eval/hazard_cost_per_step'] = (
+                    metrics['eval/episode_hazard_cost'] / metrics['eval/avg_episode_length'])
+                for key, value in metrics.items():
+                    record[f'{policy}/{scope}/{key.removeprefix("eval/")}'] = float(value)
             eval_log.write(json.dumps(record)+'\n'); eval_log.flush()
             run_log.log(record, step=environment_steps, commit=False)
             if args.wandb_mode != 'disabled':
+                import matplotlib.pyplot as plt
+
                 evaluation_history.append(record)
                 steps = [row['num_steps'] for row in evaluation_history]
                 charts = {}
                 for key in record:
-                    if not key.startswith('baseline/eval/'):
+                    if not key.startswith('baseline/'):
                         continue
-                    metric = key.removeprefix('baseline/eval/')
-                    charts[f'eval_comparison/{metric}'] = wandb.plot.line_series(
-                        xs=steps,
-                        ys=[[row[f'{policy}/eval/{metric}'] for row in evaluation_history]
-                            for policy in ('baseline', 'finetuned')],
-                        keys=['Baseline', 'Fine-tuned'], title=metric, xname='num_steps',
-                        split_table=True)
+                    _, scope, metric = key.split('/', 2)
+                    fig, ax = plt.subplots(figsize=(6, 3.5), layout='constrained')
+                    for policy, label, color, style in (
+                        ('baseline', 'Baseline', '#0072B2', '-'),
+                        ('finetuned', 'Fine-tuned', '#D55E00', '--'),
+                    ):
+                        values = [row[f'{policy}/{scope}/{metric}'] for row in evaluation_history]
+                        ax.plot(steps, values, style, color=color, marker='.', label=label)
+                    ax.set(xlabel='Training environment steps', ylabel=metric)
+                    ax.legend()
+                    charts[f'{scope}_comparison/{metric}'] = wandb.Image(fig)
+                    plt.close(fig)
                 run_log.log(charts, step=environment_steps, commit=False)
             print(json.dumps(record), flush=True)
 
