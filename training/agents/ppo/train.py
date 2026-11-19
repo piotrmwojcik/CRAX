@@ -68,6 +68,7 @@ class TrainingState:
     normalizer_params: running_statistics.RunningStatisticsState
     env_steps: types.UInt64
     aux_state: Optional[Any] = None  # For Lagrange multipliers, PID state, etc.
+    observed_episode_length: Optional[jnp.ndarray] = None
 
 
 def _unpmap(v):
@@ -249,11 +250,18 @@ def train(
         post_step_fn: Optional[PostStepFn] = None,
         extra_fields: Tuple[str, ...] = ('truncation', 'episode_metrics', 'episode_done'),
         init_aux_state_fn: Optional[Callable[[], Any]] = None,
+        observed_episode_length_bound: bool = False,
+        episode_length_ema: float = 0.9,
+        safety_bound: float = 0.0,
 ):
     """PPO training.
 
     Args:
       environment: the environment to train
+      observed_episode_length_bound: report the per-step safety budget and cost
+        violation using the moving average length of completed rollout episodes.
+      episode_length_ema: weight of the previous observed length in the average.
+      safety_bound: episodic cost budget for the optional PPO diagnostics.
       num_timesteps: the total number of environment steps to use during training
       max_devices_per_host: maximum number of chips to use per host process
       wrap_env: If True, wrap the environment for training. Otherwise use the
@@ -342,6 +350,10 @@ def train(
     _dbg(f"train() called: num_envs={num_envs}, num_timesteps={num_timesteps}, episode_length={episode_length}, augment_pixels={augment_pixels}")
 
     assert batch_size * num_minibatches % num_envs == 0
+    if observed_episode_length_bound:
+        if episode_length is None or episode_length <= 0 or not 0 <= episode_length_ema < 1:
+            raise ValueError('Observed length requires episode_length > 0 and episode_length_ema in [0, 1).')
+        extra_fields = tuple(dict.fromkeys((*extra_fields, 'cost', 'steps')))
 
     xt = time.time()
 
@@ -630,12 +642,33 @@ def train(
             length=num_updates_per_batch,
         )
 
+        observed_length = training_state.observed_episode_length
+        if observed_episode_length_bound:
+            # Count each rollout once, before any reuse across SGD epochs.
+            extras = data.extras['state_extras']
+            done = extras['episode_done']
+            completed = jnp.sum(done)
+            length_sum = jnp.sum(done * extras['steps'])
+            mean_cost = jnp.mean(extras['cost'])
+            if use_pmap:
+                completed, length_sum = jax.lax.psum((completed, length_sum), pmap_axis_name)
+                mean_cost = jax.lax.pmean(mean_cost, pmap_axis_name)
+            batch_length = length_sum / jnp.maximum(completed, 1)
+            observed_length = jnp.where(
+                completed > 0,
+                episode_length_ema * observed_length + (1 - episode_length_ema) * batch_length,
+                observed_length)
+            step_bound = safety_bound / observed_length
+            metrics.update(observed_episode_length=observed_length, per_step_safety_bound=step_bound,
+                           mean_cost=mean_cost, cost_violation=mean_cost - step_bound)
+
         new_training_state = TrainingState(
             optimizer_state=optimizer_state,
             params=params,
             normalizer_params=normalizer_params,
             env_steps=training_state.env_steps + env_step_per_training_step,
             aux_state=training_state.aux_state,
+            observed_episode_length=observed_length,
         )
 
         # Apply post-step hook if provided (for Lagrange multiplier updates, etc.)
@@ -748,6 +781,8 @@ def train(
         ),
         env_steps=types.UInt64(hi=0, lo=0),
         aux_state=initial_aux_state,
+        observed_episode_length=(jnp.asarray(episode_length, jnp.float32)
+                                 if observed_episode_length_bound else None),
     )
     _dbg("TrainingState created.")
 
