@@ -4,6 +4,7 @@ Based on mourad_lag.ipynb training approach.
 """
 
 import functools
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -120,7 +121,11 @@ def resolve_privilege_routing(config, alg_name):
 def main():
     """Main function to run training from command line."""
     parser = build_base_parser(description='Train Safe-Brax agents from config files')
+    parser.add_argument('--train_env_kwargs', type=json.loads, default={},
+                        help='JSON object of environment overrides used only for training rollouts')
     config = parser.parse_args()
+    if not isinstance(config.train_env_kwargs, dict):
+        parser.error('--train_env_kwargs requires a JSON object')
 
     if config.cost_conditioning and config.alg != 'sac_lag':
         parser.error('--cost_conditioning is supported only with --alg sac_lag')
@@ -195,7 +200,8 @@ def main():
         if config.vision:
             # GpuPixelObservationWrapper reads geom_xpos/cam_xpos, which only the MJX pipeline populates.
             env_kwargs.setdefault('backend', 'mjx')
-        env = envs.get_environment(env_name, level=difficulty, **env_kwargs)
+        train_env_kwargs = {**env_kwargs, **config.train_env_kwargs}
+        env = envs.get_environment(env_name, level=difficulty, **train_env_kwargs)
         eval_env = envs.get_environment(env_name, level=difficulty, **env_kwargs)
 
         # Distinct per-limb colours in the pixel observations
@@ -209,7 +215,7 @@ def main():
                       f"colour scheme (see crax/envs/limb_colors.py); left unchanged.")
 
         # Determine the episode length
-        episode_length = config.episode_length or env_kwargs.get('episode_length') or getattr(env, 'episode_length', None)
+        episode_length = config.episode_length or train_env_kwargs.get('episode_length') or getattr(env, 'episode_length', None)
 
         # Periodic mid-training video, --vision only: a dedicated single-env vision-wrapped
         # rollout env, reading frames straight off its own GPU (MJWarp) pixel observations.
@@ -248,8 +254,8 @@ def main():
                 seed=seed,
             )
 
-        print(f"Training environment '{env_name}' instantiated with difficulty {difficulty}.")
-        print(f"Evaluation environment '{env_name}' instantiated with difficulty {difficulty}.")
+        print(f"Training environment '{env_name}' at level {difficulty} with overrides {train_env_kwargs}.")
+        print(f"Evaluation environment '{env_name}' at level {difficulty} with overrides {env_kwargs}.")
 
         cli_cfg = vars(config)
         runtime_cfg = {"seed": seed, "timestamp": timestamp, "episode_length": episode_length}
