@@ -27,7 +27,6 @@ srun python -u -m training.train_env \
   --alg ppo \
   --env_name safe_pathway_walker2d \
   --difficulty 3 \
-  --train_env_kwargs '{"num_hazards":0}' \
   --num_timesteps 500000000 \
   --num_envs 2048 \
   --batch_size 1024 \
@@ -41,7 +40,8 @@ srun python -u -m training.train_env \
   --num_eval_envs 128 \
   --seeds 0 \
   --use_wandb true \
-  --wandb_tags empty-train-level3-eval \
+  --wandb_tags level3-train-level3-eval \
   --store_model true \
   --skip_rollout \
   --skip_video
+
